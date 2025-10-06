@@ -71,7 +71,7 @@ class DPPromptPrivatizer(DPMechanism):
         prompt = self._create_prompt(text)
         
         with DPPromptModelManager(self.config.model_config) as (model, tokenizer):
-            # Tokenize input
+            
             model_inputs = tokenizer(
                 prompt, 
                 max_length=self.config.model_config.max_sequence_length,
@@ -79,13 +79,13 @@ class DPPromptPrivatizer(DPMechanism):
                 return_tensors="pt"
             ).to(model.device)
             
-            # Determine max new tokens
+            
             max_new_tokens = (
                 self.config.max_new_tokens or 
                 len(model_inputs["input_ids"][0])
             )
             
-            # Generate private text
+            
             output = model.generate(
                 **model_inputs,
                 do_sample=self.config.do_sample,
@@ -98,11 +98,11 @@ class DPPromptPrivatizer(DPMechanism):
             
             private_text = tokenizer.decode(output[0], skip_special_tokens=True)
             
-            # Clean up the output (remove prompt)
+            
             if private_text.startswith(prompt):
                 private_text = private_text[len(prompt):].strip()
         
-        # Calculate perturbation metrics (approximate)
+        
         original_tokens = len(text.split())
         private_tokens = len(private_text.split())
         
@@ -146,10 +146,10 @@ class DPParaphrasePrivatizer(DPMechanism):
     
     def _cleanup_output(self, text: str, prompt: str) -> str:
         """Clean up generated output."""
-        # Remove prompt
+        
         result = text.replace(prompt, "").replace(prompt.strip(), "")
         
-        # Clean up specified characters
+        
         for char in self.config.output_cleanup_chars:
             result = result.replace(char, " " if char == "\xa0" else "")
         
@@ -164,7 +164,7 @@ class DPParaphrasePrivatizer(DPMechanism):
         prompt = self._create_prompt(text)
         
         with DPParaphraseModelManager(self.config.model_config) as (model, tokenizer):
-            # Setup pipeline
+            
             pipe = pipeline(
                 task="text-generation",
                 model=model,
@@ -174,21 +174,21 @@ class DPParaphrasePrivatizer(DPMechanism):
                 pad_token_id=tokenizer.eos_token_id
             )
             
-            # Determine max new tokens
+            
             length = len(tokenizer(prompt)["input_ids"])
             max_new_tokens = self.config.max_new_tokens or length
             
-            # Generate private text
+            
             generated = pipe(
                 prompt,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature
             )[0]["generated_text"]
             
-            # Clean up output
+            
             private_text = self._cleanup_output(generated, prompt)
         
-        # Calculate perturbation metrics (approximate)
+        
         original_tokens = len(text.split())
         private_tokens = len(private_text.split())
         
@@ -221,7 +221,7 @@ class DPBartPrivatizer(DPMechanism):
     
     def _calibrate_analytic_gaussian(self, epsilon: float, delta: float, sensitivity: float) -> float:
         """Calibrate analytic Gaussian mechanism with high precision."""
-        # Import mpmath locally to avoid dependency issues
+        
         try:
             import mpmath
             from mpmath import mp
@@ -230,7 +230,7 @@ class DPBartPrivatizer(DPMechanism):
             scale = np.sqrt((sensitivity**2 / epsilon**2) * 2 * np.log(1.25 / delta))
             return scale
         
-        # Set precision based on epsilon value
+        
         if epsilon <= 1000:
             mp.dps = self.config.precision_dps.get("1000", 500)
         elif epsilon <= 2500:
@@ -318,7 +318,7 @@ class DPBartPrivatizer(DPMechanism):
         with DPBartModelManager(self.config.model_config) as (models, tokenizer):
             encoder_model, decoder_model = models
             
-            # Tokenize input
+            
             inputs = tokenizer(
                 text,
                 max_length=self.config.model_config.max_sequence_length,
@@ -328,15 +328,15 @@ class DPBartPrivatizer(DPMechanism):
             
             num_tokens = len(inputs["input_ids"][0])
             
-            # Encode with noise
+            
             enc_output = encoder_model.encoder(**inputs)
             
-            # Apply clipping and noise
+            
             clipped_hidden = self._clip_vector(enc_output["last_hidden_state"].cpu())
             noisy_hidden = self._add_noise(clipped_hidden, epsilon)
             enc_output["last_hidden_state"] = noisy_hidden.float().to(encoder_model.device)
             
-            # Decode
+            
             dec_out = decoder_model.generate(
                 encoder_outputs=enc_output,
                 max_new_tokens=num_tokens
@@ -344,7 +344,7 @@ class DPBartPrivatizer(DPMechanism):
             
             private_text = tokenizer.decode(dec_out[0], skip_special_tokens=True).strip()
         
-        # Calculate perturbation metrics (approximate)
+        
         original_tokens = len(text.split())
         private_tokens = len(private_text.split())
         
@@ -363,7 +363,7 @@ class DPBartPrivatizer(DPMechanism):
         )
 
 
-# Factory functions for easy instantiation
+
 def create_dpprompt_privatizer(config: Optional[DPPromptConfig] = None) -> DPPromptPrivatizer:
     """Create a DPPrompt privatizer with optional configuration."""
     return DPPromptPrivatizer(config)

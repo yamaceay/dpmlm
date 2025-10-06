@@ -13,6 +13,15 @@ from dpmlm.config import (
     create_dpmlm_config, create_dpprompt_config, 
     create_dpparaphrase_config, create_dpbart_config
 )
+from dpmlm.core import (
+    DPMLMRewriteSettings,
+    DPMLMMechanism,
+    AllTokensSelection,
+    PIITokenSelection,
+    UniformScoring,
+    GreedyScoring,
+    ShapScoring,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,17 +34,16 @@ class DPMechanismFactory:
             "dpmlm": self._create_dpmlm,
             "dpprompt": self._create_dpprompt,
             "dpparaphrase": self._create_dpparaphrase,
-            "dpbart": self._create_dpbart
+            "dpbart": self._create_dpbart,
         }
         
-    def create_mechanism(self, mechanism_type: str, config: Optional[Dict[str, Any]] = None, 
-                        annotator: Any = None) -> DPMechanism:
+    def create_mechanism(self, mechanism_type: str, config: Optional[Dict[str, Any]] = None) -> DPMechanism:
         """Create a differential privacy mechanism.
         
         Args:
-            mechanism_type: Type of mechanism ("dpmlm", "dpprompt", "dpparaphrase", "dpbart")
+            mechanism_type: Type of mechanism ("dpmlm", "dpmlm_riskaware",
+                "dpprompt", "dpparaphrase", "dpbart")
             config: Configuration dictionary or None for defaults
-            annotator: Optional annotator for PII detection (DPMLM only)
             
         Returns:
             Configured DPMechanism instance
@@ -48,29 +56,62 @@ class DPMechanismFactory:
                            f"Available types: {list(self._creators.keys())}")
         
         logger.info("Creating %s mechanism", mechanism_type)
-        return self._creators[mechanism_type](config, annotator)
+        return self._creators[mechanism_type](config)
     
     def list_available_mechanisms(self) -> List[str]:
         """List available mechanism types."""
         return list(self._creators.keys())
-    
-    def _create_dpmlm(self, config: Optional[Dict[str, Any]], annotator: Any) -> DPMechanism:
-        """Create DPMLM mechanism."""
-        # Import locally to avoid circular imports and dependency issues
-        try:
-            from dpmlm.core import DPMLMPrivatizer
-        except ImportError as e:
-            logger.error("Failed to import DPMLMPrivatizer: %s", e)
-            raise ImportError("DPMLM dependencies not available") from e
-        
-        if config is None:
-            dp_config = DPMLMConfig()
+
+    def _create_dpmlm(self, config: Optional[Dict[str, Any]]) -> DPMechanism:
+        """Create risk-aware DPMLM rewrite mechanism."""
+
+        config = config or {}
+
+        # Support both a nested configuration dict and a flat DPMLM config.
+        has_nested = any(key in config for key in ("dpmlm", "dpmlm_config", "risk", "risk_settings", "risk_config"))
+
+        if has_nested:
+            dp_payload = config.get("dpmlm") or config.get("dpmlm_config") or {}
+            risk_payload = config.get("risk") or config.get("risk_settings") or config.get("risk_config") or {}
         else:
-            dp_config = create_dpmlm_config(**config)
-        
-        return DPMLMPrivatizer(dp_config, annotator)
-    
-    def _create_dpprompt(self, config: Optional[Dict[str, Any]], annotator: Any) -> DPMechanism:  # pylint: disable=unused-argument
+            dp_payload = config
+            risk_payload = {}
+
+        if dp_payload:
+            dp_config = create_dpmlm_config(**dp_payload)
+        else:
+            dp_config = DPMLMConfig()
+
+        risk_settings = DPMLMRewriteSettings(**risk_payload) if risk_payload else DPMLMRewriteSettings()
+
+        annotator_obj = risk_settings.annotator
+
+        if annotator_obj is not None and risk_settings.annotator is None:
+            risk_settings.annotator = annotator_obj
+
+        if dp_config.process_pii_only:
+            selection_strategy = PIITokenSelection(annotator=annotator_obj, threshold=risk_settings.pii_threshold)
+        else:
+            selection_strategy = AllTokensSelection()
+
+        mode = (risk_settings.explainability_mode or "uniform").lower()
+        if mode == "greedy":
+            scoring_strategy = GreedyScoring()
+        elif mode == "shap":
+            scoring_strategy = ShapScoring()
+        else:
+            scoring_strategy = UniformScoring()
+
+        risk_settings.annotator = annotator_obj
+
+        return DPMLMMechanism(
+            config=dp_config,
+            settings=risk_settings,
+            selection_strategy=selection_strategy,
+            scoring_strategy=scoring_strategy,
+        )
+
+    def _create_dpprompt(self, config: Optional[Dict[str, Any]]) -> DPMechanism:  
         """Create DPPrompt mechanism."""
         try:
             from dpmlm.llmdp import DPPromptPrivatizer
@@ -85,7 +126,7 @@ class DPMechanismFactory:
         
         return DPPromptPrivatizer(dp_config)
     
-    def _create_dpparaphrase(self, config: Optional[Dict[str, Any]], annotator: Any) -> DPMechanism:  # pylint: disable=unused-argument
+    def _create_dpparaphrase(self, config: Optional[Dict[str, Any]]) -> DPMechanism:  
         """Create DPParaphrase mechanism."""
         try:
             from dpmlm.llmdp import DPParaphrasePrivatizer
@@ -100,7 +141,7 @@ class DPMechanismFactory:
         
         return DPParaphrasePrivatizer(dp_config)
     
-    def _create_dpbart(self, config: Optional[Dict[str, Any]], annotator: Any) -> DPMechanism:  # pylint: disable=unused-argument
+    def _create_dpbart(self, config: Optional[Dict[str, Any]]) -> DPMechanism:  
         """Create DPBart mechanism."""
         try:
             from dpmlm.llmdp import DPBartPrivatizer
@@ -174,13 +215,12 @@ class ConfigurableDPFactory:
             }
         }
     
-    def create_from_preset(self, preset_name: str, annotator: Any = None, 
+    def create_from_preset(self, preset_name: str,
                           override_config: Optional[Dict[str, Any]] = None) -> DPMechanism:
         """Create mechanism from preset configuration.
         
         Args:
             preset_name: Name of preset configuration
-            annotator: Optional annotator for PII detection
             override_config: Optional config overrides
             
         Returns:
@@ -194,17 +234,16 @@ class ConfigurableDPFactory:
         mechanism_type = preset["type"]
         config = preset["config"].copy()
         
-        # Apply overrides
+        
         if override_config:
             config.update(override_config)
         
         logger.info("Creating mechanism from preset: %s", preset_name)
-        return self.base_factory.create_mechanism(mechanism_type, config, annotator)
-    
-    def create_mechanism(self, mechanism_type: str, config: Optional[Dict[str, Any]] = None,
-                        annotator: Any = None) -> DPMechanism:
+        return self.base_factory.create_mechanism(mechanism_type, config)
+
+    def create_mechanism(self, mechanism_type: str, config: Optional[Dict[str, Any]] = None) -> DPMechanism:
         """Delegate to base factory."""
-        return self.base_factory.create_mechanism(mechanism_type, config, annotator)
+        return self.base_factory.create_mechanism(mechanism_type, config)
     
     def list_available_mechanisms(self) -> List[str]:
         """List available mechanism types."""
@@ -215,38 +254,35 @@ class ConfigurableDPFactory:
         return list(self._presets.keys())
 
 
-# Global factory instance
+
 _factory = ConfigurableDPFactory()
 
 
-def create_mechanism(mechanism_type: str, config: Optional[Dict[str, Any]] = None,
-                    annotator: Any = None) -> DPMechanism:
+def create_mechanism(mechanism_type: str, config: Optional[Dict[str, Any]] = None) -> DPMechanism:
     """Create a differential privacy mechanism using the global factory.
     
     Args:
         mechanism_type: Type of mechanism ("dpmlm", "dpprompt", "dpparaphrase", "dpbart")
         config: Configuration dictionary or None for defaults
-        annotator: Optional annotator for PII detection (DPMLM only)
         
     Returns:
         Configured DPMechanism instance
     """
-    return _factory.create_mechanism(mechanism_type, config, annotator)
+    return _factory.create_mechanism(mechanism_type, config)
 
 
-def create_from_preset(preset_name: str, annotator: Any = None,
+def create_from_preset(preset_name: str,
                       override_config: Optional[Dict[str, Any]] = None) -> DPMechanism:
     """Create mechanism from preset configuration using the global factory.
     
     Args:
         preset_name: Name of preset configuration
-        annotator: Optional annotator for PII detection
         override_config: Optional config overrides
         
     Returns:
         Configured DPMechanism instance
     """
-    return _factory.create_from_preset(preset_name, annotator, override_config)
+    return _factory.create_from_preset(preset_name, override_config)
 
 
 def list_mechanisms() -> List[str]:
@@ -259,7 +295,7 @@ def list_presets() -> List[str]:
     return _factory.list_presets()
 
 
-# Configuration builders for common scenarios
+
 def build_dpmlm_config(epsilon: float = 1.0, process_pii_only: bool = True,
                       model_name: str = "roberta-base", **kwargs) -> Dict[str, Any]:
     """Build DPMLM configuration with common parameters."""

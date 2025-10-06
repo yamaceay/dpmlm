@@ -6,12 +6,14 @@ the same design patterns as the PII module.
 """
 
 import logging
-from typing import Dict, List, Tuple, Optional, Union, Any
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import string
 import numpy as np
 import torch
 from nltk.tokenize.treebank import TreebankWordTokenizer, TreebankWordDetokenizer
 from collections import Counter
+from abc import ABC, abstractmethod
 
 from dpmlm.interfaces import DPMechanism, PrivacyResult, TokenSpan, DPTokenizer
 from dpmlm.config import DPMLMConfig
@@ -42,7 +44,7 @@ class DPMLMTokenizer:
                 for start, end in spans
             ]
         else:
-            # Fallback to simple word tokenization
+            
             import nltk
             tokens = nltk.word_tokenize(text)
             spans = []
@@ -126,154 +128,318 @@ class DPMLMCore:
         """Calculate temperature for differential privacy."""
         return 2 * self.config.sensitivity / epsilon
     
-    def _chunk_sequence_if_needed(self, input_ids: List[int], mask_positions: List[int]) -> Tuple[List[int], List[int]]:
-        """Chunk sequence if it exceeds max length."""
+    def _chunk_sequence_if_needed(
+        self,
+        input_ids: List[int],
+        mask_positions: List[int],
+    ) -> List[Tuple[List[int], List[int]]]:
+        """Return a single truncated window containing the mask token."""
         max_len = self.config.model_config.max_sequence_length
-        
+
         if len(input_ids) <= max_len:
-            return input_ids, mask_positions
-            
-        # Find optimal chunk around mask positions
-        if mask_positions:
-            mask_pos = mask_positions[0]
-            available_tokens = max_len - 2  # Account for special tokens
-            context_per_side = available_tokens // 2
-            
-            start_pos = max(0, mask_pos - context_per_side)
-            end_pos = min(len(input_ids), mask_pos + context_per_side + 1)
-            
-            if start_pos == 0:
-                end_pos = min(len(input_ids), max_len)
-            elif end_pos == len(input_ids):
-                start_pos = max(0, len(input_ids) - max_len)
-            
-            # Adjust mask positions
-            adjusted_mask_positions = [
-                pos - start_pos for pos in mask_positions 
-                if start_pos <= pos < end_pos
-            ]
-            
-            return input_ids[start_pos:end_pos], adjusted_mask_positions
-        
-        # If no mask positions, just truncate
-        return input_ids[:max_len], []
+            return [(input_ids, mask_positions)]
+
+        truncated_ids = input_ids[:max_len]
+        adjusted_positions = [pos for pos in mask_positions if pos < max_len]
+        if not adjusted_positions and mask_positions:
+            adjusted_positions = [min(mask_positions[0], max_len - 1)]
+
+        return [(truncated_ids, adjusted_positions)]
 
 
-class DPMLMPrivatizer(DPMechanism):
-    """High-level DPMLM privatizer implementing the DPMechanism interface."""
-    
-    def __init__(self, config: DPMLMConfig, annotator=None):
+# ---------------------------------------------------------------------------
+# Strategy-based DPMLM rewriting
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DPMLMRewriteSettings:
+    """Configuration for risk-aware rewriting behaviour."""
+
+    risk_pipeline: Optional[Any] = None
+    annotator: Optional[Any] = None
+    pii_threshold: float = 0.0
+    min_weight: float = 1e-6
+    maintain_expected_noise: bool = True
+    top_k: Optional[int] = None
+    clip_contribution: Optional[float] = None
+    explainability_mode: str = "uniform"
+    explainability_label: Optional[Any] = None
+    mask_text: str = "<mask>"
+    shap_silent: bool = True
+    shap_batch_size: int = 1
+    summary_top_k: int = 10
+
+
+class TokenSelectionStrategy(ABC):
+    """Defines which token spans should be considered for protection."""
+
+    def __init__(self, annotator: Optional[Any] = None, threshold: float = 0.0):
+        self._annotator = annotator
+        self.threshold = threshold
+
+    @abstractmethod
+    def mark(
+        self,
+        spans: List[TokenSpan],
+        text: str,
+        *args,
+    ) -> List[TokenSpan]:
+        """Mark spans as critical in-place and return the list."""
+
+
+class AllTokensSelection(TokenSelectionStrategy):
+    """Marks every token span as critical."""
+
+    def mark(self, spans: List[TokenSpan], text: str, *args) -> List[TokenSpan]:  # noqa: ARG002
+        for span in spans:
+            span.is_critical = True
+        return spans
+
+
+class PIITokenSelection(TokenSelectionStrategy):
+    """Marks spans intersecting PII predictions as critical."""
+
+    def mark(self, spans: List[TokenSpan], text: str, *args) -> List[TokenSpan]:
+        annotator = self._annotator
+        if annotator is None:
+            raise ValueError(
+                "PII token selection requested but no annotator provided; falling back to baseline selection."
+            )
+
+        predictions = annotator.predict(text)
+        unique_labels = getattr(annotator.labels, "unique_labels", [])
+
+        for span in spans:
+            span.is_critical = False
+
+        for prediction in predictions:
+            entity_group = prediction.get("entity_group")
+            if unique_labels and entity_group not in unique_labels:
+                continue
+            start, end = prediction.get("start"), prediction.get("end")
+            if start is None or end is None:
+                continue
+            if prediction.get("score") is not None and prediction["score"] < self.threshold:
+                continue
+            for span in spans:
+                if span.start < end and span.end > start:
+                    span.is_critical = True
+                    span.entity_type = entity_group
+
+        if not any(span.is_critical for span in spans):
+            logger.debug("No PII spans detected; defaulting to baseline selection.")
+            return AllTokensSelection().mark(spans, text)
+
+        return spans
+
+
+@dataclass
+class ScoringContext:
+    risk_settings: DPMLMRewriteSettings
+    mechanism: "DPMLMMechanism"
+
+
+class ScoringStrategy(ABC):
+    """Produces contribution scores for a list of critical spans."""
+
+    def __init__(self, name: str = "uniform"):
+        self.name = name
+
+    @abstractmethod
+    def score(
+        self,
+        text: str,
+        spans: List[TokenSpan],
+        context: ScoringContext,
+    ) -> np.ndarray:
+        """Return raw (unnormalised) contribution scores."""
+
+
+class UniformScoring(ScoringStrategy):
+    def __init__(self) -> None:
+        super().__init__(name="uniform")
+
+    def score(self, text: str, spans: List[TokenSpan], context: ScoringContext) -> np.ndarray:  # noqa: ARG002
+        if not spans:
+            return np.array([], dtype=float)
+        return np.ones(len(spans), dtype=float)
+
+
+class GreedyScoring(ScoringStrategy):
+    def __init__(self) -> None:
+        super().__init__(name="greedy")
+
+    def score(self, text: str, spans: List[TokenSpan], context: ScoringContext) -> np.ndarray:
+        pipeline = context.risk_settings.risk_pipeline
+        if pipeline is None or not spans:
+            logger.debug("Greedy scoring requested without pipeline; reverting to uniform weights.")
+            return np.ones(len(spans), dtype=float)
+
+        label_index = context.mechanism._resolve_label_index(pipeline, text)
+        base_prob = context.mechanism._label_probability(pipeline, text, label_index)
+        if base_prob is None:
+            logger.debug("Failed to obtain base probability for greedy scoring; using uniform weights.")
+            return np.ones(len(spans), dtype=float)
+
+        scores: List[float] = []
+        mask_text = context.risk_settings.mask_text
+        for span in spans:
+            masked_text = context.mechanism._mask_span(text, span, mask_text)
+            prob = context.mechanism._label_probability(pipeline, masked_text, label_index)
+            if prob is None:
+                scores.append(0.0)
+            else:
+                scores.append(float(max(0.0, base_prob - prob)))
+
+        scores_array = np.array(scores, dtype=float)
+        if np.allclose(scores_array, 0.0):
+            logger.debug("Greedy scores collapsed to zero; returning uniform weights.")
+            return np.ones(len(spans), dtype=float)
+        return scores_array
+
+
+class ShapScoring(ScoringStrategy):
+    def __init__(self) -> None:
+        super().__init__(name="shap")
+
+    def score(self, text: str, spans: List[TokenSpan], context: ScoringContext) -> np.ndarray:
+        pipeline = context.risk_settings.risk_pipeline
+        if pipeline is None or not spans:
+            logger.debug("SHAP scoring requested without pipeline; reverting to uniform weights.")
+            return np.ones(len(spans), dtype=float)
+
+        explainer = context.mechanism._ensure_shap_explainer(pipeline)
+        if explainer is None:
+            logger.debug("Unable to initialise SHAP explainer; using uniform weights.")
+            return np.ones(len(spans), dtype=float)
+
+        try:
+            shap_values = explainer([text], batch_size=context.risk_settings.shap_batch_size)
+        except TypeError:
+            shap_values = explainer([text])
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to compute SHAP values (%s); using uniform weights.", exc)
+            return np.ones(len(spans), dtype=float)
+
+        if not hasattr(shap_values, "values"):
+            logger.debug("SHAP values object missing 'values'; using uniform weights.")
+            return np.ones(len(spans), dtype=float)
+
+        label_index = context.mechanism._resolve_label_index(pipeline, text)
+        token_weights = shap_values.values[0, :, label_index]
+        tokenizer = getattr(pipeline, "tokenizer", None)
+        if tokenizer is None:
+            logger.debug("Risk pipeline lacks tokenizer; SHAP scoring falls back to uniform weights.")
+            return np.ones(len(spans), dtype=float)
+
+        term_to_token = context.mechanism._terms_to_tokens(text, spans, tokenizer)
+        scores: List[float] = []
+        for token_indices in term_to_token:
+            if not token_indices:
+                scores.append(0.0)
+            else:
+                contrib = sum(
+                    float(token_weights[idx])
+                    for idx in token_indices
+                    if 0 <= idx < len(token_weights)
+                )
+                scores.append(contrib)
+
+        scores_array = np.array(scores, dtype=float)
+        if np.allclose(scores_array, 0.0):
+            logger.debug("SHAP scores collapsed to zero; defaulting to uniform weights.")
+            return np.ones(len(spans), dtype=float)
+        return scores_array
+
+
+@dataclass
+class TokenRiskAllocation:
+    span: TokenSpan
+    score: float
+    weight: float
+    epsilon: float
+
+    def to_metadata(self, rank: int) -> Dict[str, Any]:
+        data = {
+            "rank": rank,
+            "start": int(self.span.start),
+            "end": int(self.span.end),
+            "token": self.span.text.replace("\n", " "),
+            "score": float(self.score),
+            "weight": float(self.weight),
+            "epsilon": float(self.epsilon),
+        }
+        if getattr(self.span, "entity_type", None):
+            data["entity_type"] = self.span.entity_type
+        return data
+
+
+class DPMLMMechanism(DPMechanism):
+    """High-level DPMLM rewrite mechanism driven by strategies."""
+
+    def __init__(
+        self,
+        config: DPMLMConfig,
+        settings: DPMLMRewriteSettings,
+        selection_strategy: Optional[TokenSelectionStrategy] = None,
+        scoring_strategy: Optional[ScoringStrategy] = None,
+    ) -> None:
         self.config = config
+        self.settings = settings
         self.core = DPMLMCore(config)
-        self.annotator = annotator
-        self._setup_resources()
-        
-    def _setup_resources(self) -> None:
-        """Setup model resources."""
         self.device = self.core._get_device()
         logger.info("DPMLM privatizer initialized on device: %s", self.device)
-        
+
+        self.selection_strategy = selection_strategy or self._build_selection_strategy()
+        self.scoring_strategy = scoring_strategy or self._build_scoring_strategy()
+        self._shap_explainer = None
+
     def validate_epsilon(self, epsilon: float) -> bool:
-        """Validate epsilon parameter."""
         return epsilon > 0
-        
-    def _mark_critical_tokens(self, spans: List[TokenSpan], text: str) -> List[TokenSpan]:
-        """Mark critical (PII) tokens if annotator is available."""
-        if not self.annotator or not self.config.process_pii_only:
-            # Mark all tokens as critical if no annotator
-            for span in spans:
-                span.is_critical = True
-            return spans
-            
-        # Use annotator to identify PII tokens
-        predictions = self.annotator.predict(text)
-        unique_labels = getattr(self.annotator.labels, 'unique_labels', [])
-        
-        for prediction in predictions:
-            if prediction.get('entity_group') in unique_labels:
-                start, end = prediction['start'], prediction['end']
-                for span in spans:
-                    if (span.start <= start < span.end or 
-                        span.start < end <= span.end):
-                        span.is_critical = True
-                        span.entity_type = prediction.get('entity_group')
-        
-        return spans
-    
+
     def privatize(self, text: str, epsilon: float, **kwargs) -> PrivacyResult:
-        """Apply differential privacy to text."""
+        if epsilon <= 0:
+            raise ValueError(f"Invalid epsilon: {epsilon}")
+
+        spans = self.core.tokenizer_wrapper.tokenize_with_spans(text)
+        spans = self.selection_strategy.mark(
+            spans,
+            text,
+        )
+        critical_spans = [span for span in spans if span.is_critical]
+
+        context = ScoringContext(
+            risk_settings=self.settings,
+            mechanism=self,
+        )
+        scores = self.scoring_strategy.score(text, critical_spans, context)
+        if scores.size != len(critical_spans):
+            scores = np.ones(len(critical_spans), dtype=float)
+
+        ranking_weights = self._compute_ranking_weights(scores)
+        allocations = self._build_allocations(critical_spans, scores, ranking_weights, epsilon)
+        allocations.sort(key=lambda alloc: (alloc.weight, alloc.score), reverse=True)
+
+        token_eps_map = {
+            (alloc.span.start, alloc.span.end): alloc.epsilon for alloc in allocations
+        }
+
         if not self.validate_epsilon(epsilon):
             raise ValueError(f"Invalid epsilon: {epsilon}")
-            
-        method = kwargs.get('method', 'patch')
+
         use_plus = kwargs.get('plus', False)
         
-        if method == 'patch':
-            if use_plus:
-                return self._privatize_patch_plus(text, epsilon, **kwargs)
-            else:
-                return self._privatize_patch(text, epsilon, **kwargs)
-        else:
-            if use_plus:
-                return self._privatize_plus(text, epsilon, **kwargs)
-            else:
-                return self._privatize_basic(text, epsilon, **kwargs)
-    
-    def _privatize_patch(self, text: str, epsilon: float, **kwargs) -> PrivacyResult:
-        """Apply patch-based privatization."""
-        spans = self.core.tokenizer_wrapper.tokenize_with_spans(text)
-        spans = self._mark_critical_tokens(spans, text)
-        
-        perturbed = 0
-        total = 0
-        result = text
-        offset_adjust = 0
-        
-        with DPMLMModelManager(self.config.model_config, str(self.device)) as (models, tokenizer):
-            lm_model, raw_model = models
-            
-            for span in spans:
-                if not span.is_critical:
-                    total += 1
-                    continue
-                    
-                if span.text in string.punctuation:
-                    total += 1
-                    continue
-                
-                # Apply privatization to this token
-                adjusted_start = span.start + offset_adjust
-                adjusted_end = span.end + offset_adjust
-                
-                private_token = self._privatize_single_token(
-                    text, span.text, epsilon, lm_model, raw_model, tokenizer
-                )
-                
-                # Handle capitalization
-                if span.text and span.text[0].isupper():
-                    private_token = private_token.capitalize() if private_token else span.text
-                elif span.text and span.text[0].islower():
-                    private_token = private_token.lower() if private_token else span.text
-                
-                # Apply replacement
-                result = result[:adjusted_start] + private_token + result[adjusted_end:]
-                offset_adjust += len(private_token) - len(span.text)
-                
-                if private_token != span.text:
-                    perturbed += 1
-                total += 1
-        
-        return PrivacyResult(
-            original_text=text,
-            private_text=result,
-            perturbed_tokens=perturbed,
-            total_tokens=total
-        )
-    
-    def _privatize_patch_plus(self, text: str, epsilon: float, **kwargs) -> PrivacyResult:
-        """Apply patch-based privatization with addition/deletion."""
-        spans = self.core.tokenizer_wrapper.tokenize_with_spans(text)
-        spans = self._mark_critical_tokens(spans, text)
+        if not use_plus:
+            kwargs.update({
+                'add_probability': 0.0, 
+                'delete_probability': 0.0,
+            })
+
+
+        # Get hyperparameters from kwargs with defaults
+        add_probability = kwargs.get('add_probability', kwargs.get('ADD_PROB', 0.15))
+        delete_probability = kwargs.get('delete_probability', kwargs.get('DEL_PROB', 0.05))
         
         perturbed = 0
         total = 0
@@ -294,28 +460,33 @@ class DPMLMPrivatizer(DPMechanism):
                     total += 1
                     continue
                 
+                span_key = (span.start, span.end)
+                local_epsilon = token_eps_map.get(span_key) if token_eps_map else epsilon
+                if not local_epsilon or local_epsilon <= 0:
+                    local_epsilon = epsilon
+
                 adjusted_start = span.start + offset_adjust
                 adjusted_end = span.end + offset_adjust
                 
-                # Deletion logic
+                
                 if i == len(spans) - 1:
-                    delete_prob = 1.0  # Never delete last token
+                    delete_prob = 1.0  
                 else:
                     delete_prob = np.random.rand()
                 
-                if delete_prob >= self.config.delete_probability:
-                    # Replace token
+                if delete_prob >= delete_probability:
+                    
                     private_token = self._privatize_single_token(
-                        text, span.text, epsilon, lm_model, raw_model, tokenizer
+                        text, span.text, local_epsilon, lm_model, raw_model, tokenizer, **kwargs
                     )
                     
-                    # Handle capitalization
+                    
                     if span.text and span.text[0].isupper():
                         private_token = private_token.capitalize() if private_token else span.text
                     elif span.text and span.text[0].islower():
                         private_token = private_token.lower() if private_token else span.text
                     
-                    # Apply replacement
+                    
                     result = result[:adjusted_start] + private_token + result[adjusted_end:]
                     offset_adjust += len(private_token) - len(span.text)
                     
@@ -323,11 +494,11 @@ class DPMLMPrivatizer(DPMechanism):
                         perturbed += 1
                     total += 1
                     
-                    # Addition logic
+                    
                     add_prob = np.random.rand()
-                    if add_prob <= self.config.add_probability:
+                    if add_prob <= add_probability:
                         add_word = self._generate_additional_token(
-                            text, epsilon, lm_model, raw_model, tokenizer
+                            text, local_epsilon, lm_model, raw_model, tokenizer, **kwargs
                         )
                         if add_word:
                             add_pos = adjusted_start + len(private_token)
@@ -335,12 +506,12 @@ class DPMLMPrivatizer(DPMechanism):
                             offset_adjust += len(" " + add_word)
                             added += 1
                 else:
-                    # Delete token
+                    
                     result = result[:adjusted_start] + result[adjusted_end:]
                     offset_adjust -= len(span.text)
                     deleted += 1
         
-        return PrivacyResult(
+        result = PrivacyResult(
             original_text=text,
             private_text=result,
             perturbed_tokens=perturbed,
@@ -348,58 +519,94 @@ class DPMLMPrivatizer(DPMechanism):
             added_tokens=added,
             deleted_tokens=deleted
         )
-    
-    def _privatize_basic(self, text: str, epsilon: float, **kwargs) -> PrivacyResult:
-        """Apply basic (non-patch) privatization."""
-        # Implementation for basic method would go here
-        # For now, delegate to patch method
-        return self._privatize_patch(text, epsilon, **kwargs)
-    
-    def _privatize_plus(self, text: str, epsilon: float, **kwargs) -> PrivacyResult:
-        """Apply basic plus privatization."""
-        # Implementation for basic plus method would go here
-        # For now, delegate to patch plus method
-        return self._privatize_patch_plus(text, epsilon, **kwargs)
+
+        result.metadata = result.metadata or {}
+        result.metadata["mechanism"] = "dpmlm"
+        result.metadata["scoring_strategy"] = self.scoring_strategy.name
+
+        token_allocations = [alloc.to_metadata(idx + 1) for idx, alloc in enumerate(allocations)]
+        result.metadata["token_allocations"] = token_allocations
+
+        top_k = min(self.settings.summary_top_k, len(token_allocations))
+        if top_k > 0:
+            result.metadata["token_allocations_summary"] = token_allocations[:top_k]
+
+        return result
     
     def _privatize_single_token(self, text: str, token: str, epsilon: float, 
-                               lm_model, raw_model, tokenizer) -> str:
+                               lm_model, raw_model, tokenizer, **kwargs) -> str:
         """Privatize a single token using the model."""
-        # This is a simplified version - full implementation would include
-        # all the logic from the original privatize_patch method
+        # Get hyperparameters from kwargs with defaults
+        use_temperature = kwargs.get('use_temperature', kwargs.get('TEMP', self.config.use_temperature))
+        k_candidates = kwargs.get('k_candidates', kwargs.get('K', self.config.k_candidates))
         
-        # Create masked sentence
+        
+        
+        
         masked_text = text.replace(token, tokenizer.mask_token, 1)
-        
-        # Tokenize and handle length
+
+
         input_ids = tokenizer.encode(masked_text, add_special_tokens=True)
-        
-        if len(input_ids) > self.config.model_config.max_sequence_length:
+
+        try:
+            mask_pos = input_ids.index(tokenizer.mask_token_id)
+        except ValueError:
+            return token
+
+        max_len = self.config.model_config.max_sequence_length
+        aggregated_logits = None
+        mask_count = 0
+
+        try:
+            chunked_inputs = self.core._chunk_sequence_if_needed(input_ids, [mask_pos])
+
+            for chunk_ids, chunk_mask_positions in chunked_inputs:
+                if not chunk_mask_positions:
+                    continue
+
+                if not chunk_ids:
+                    continue
+
+                model_input = torch.tensor(chunk_ids).reshape(1, -1).to(self.device)
+
+                with torch.no_grad():
+                    output = lm_model(model_input)
+
+                logits = output[0].squeeze().detach().cpu().numpy()
+
+                for chunk_mask_pos in chunk_mask_positions:
+                    if chunk_mask_pos < 0 or chunk_mask_pos >= logits.shape[0]:
+                        continue
+                    mask_logits_chunk = logits[chunk_mask_pos]
+                    aggregated_logits = (
+                        mask_logits_chunk.copy()
+                        if aggregated_logits is None
+                        else aggregated_logits + mask_logits_chunk
+                    )
+                    mask_count += 1
+        except Exception as exc:  # pragma: no cover - defensive safety net
+            logger.debug("Chunked inference failed; falling back to truncation: %s", exc)
+            chunked_inputs = []
+
+        if aggregated_logits is None or mask_count == 0:
+            truncated_ids = input_ids[:max_len]
             try:
-                mask_pos = input_ids.index(tokenizer.mask_token_id)
-                input_ids, _ = self.core._chunk_sequence_if_needed(input_ids, [mask_pos])
-                mask_pos = input_ids.index(tokenizer.mask_token_id) if tokenizer.mask_token_id in input_ids else -1
-            except ValueError:
-                return token  # Fallback if mask token not found
-        else:
-            try:
-                mask_pos = input_ids.index(tokenizer.mask_token_id)
+                fallback_mask_pos = truncated_ids.index(tokenizer.mask_token_id)
             except ValueError:
                 return token
-        
-        if mask_pos == -1:
-            return token
-        
-        # Get model predictions
-        model_input = torch.tensor(input_ids).reshape(1, -1).to(self.device)
-        
-        with torch.no_grad():
-            output = lm_model(model_input)
-        
-        logits = output[0].squeeze().detach().cpu().numpy()
-        mask_logits = logits[mask_pos]
-        
-        if self.config.use_temperature:
-            # Apply temperature scaling
+
+            model_input = torch.tensor(truncated_ids).reshape(1, -1).to(self.device)
+
+            with torch.no_grad():
+                output = lm_model(model_input)
+
+            logits = output[0].squeeze().detach().cpu().numpy()
+            mask_logits = logits[fallback_mask_pos]
+        else:
+            mask_logits = aggregated_logits / mask_count
+
+        if use_temperature:
+            
             temperature = self.core._calculate_temperature(epsilon)
             mask_logits = np.clip(mask_logits, self.config.clip_min, self.config.clip_max)
             mask_logits = mask_logits / temperature
@@ -407,39 +614,83 @@ class DPMLMPrivatizer(DPMechanism):
             scores = torch.softmax(torch.from_numpy(mask_logits), dim=0)
             scores = scores / scores.sum()
             
-            # Sample from distribution
+            
             chosen_idx = np.random.choice(len(mask_logits), p=scores.numpy())
             return tokenizer.decode(chosen_idx).strip()
         else:
-            # Use top-k selection
-            top_tokens = torch.topk(torch.from_numpy(mask_logits), k=self.config.k_candidates, dim=0)[1]
+            
+            top_tokens = torch.topk(torch.from_numpy(mask_logits), k=k_candidates, dim=0)[1]
             return tokenizer.decode(top_tokens[0].item()).strip()
     
     def _generate_additional_token(self, text: str, epsilon: float, 
-                                  lm_model, raw_model, tokenizer) -> str:
+                                  lm_model, raw_model, tokenizer, **kwargs) -> str:
         """Generate an additional token for insertion."""
-        # Use MASK token to generate new content
+        # Get hyperparameters from kwargs with defaults
+        use_temperature = kwargs.get('use_temperature', kwargs.get('TEMP', self.config.use_temperature))
+        k_candidates = kwargs.get('k_candidates', kwargs.get('K', self.config.k_candidates))
+        
         masked_text = text + " " + tokenizer.mask_token
-        
+
         input_ids = tokenizer.encode(masked_text, add_special_tokens=True)
-        
-        if len(input_ids) > self.config.model_config.max_sequence_length:
-            input_ids = input_ids[-self.config.model_config.max_sequence_length:]
-        
+
         try:
             mask_pos = input_ids.index(tokenizer.mask_token_id)
         except ValueError:
             return ""
-        
-        model_input = torch.tensor(input_ids).reshape(1, -1).to(self.device)
-        
-        with torch.no_grad():
-            output = lm_model(model_input)
-        
-        logits = output[0].squeeze().detach().cpu().numpy()
-        mask_logits = logits[mask_pos]
-        
-        if self.config.use_temperature:
+
+        max_len = self.config.model_config.max_sequence_length
+        aggregated_logits = None
+        mask_count = 0
+
+        try:
+            chunked_inputs = self.core._chunk_sequence_if_needed(input_ids, [mask_pos])
+
+            for chunk_ids, chunk_mask_positions in chunked_inputs:
+                if not chunk_mask_positions:
+                    continue
+
+                if not chunk_ids:
+                    continue
+
+                model_input = torch.tensor(chunk_ids).reshape(1, -1).to(self.device)
+
+                with torch.no_grad():
+                    output = lm_model(model_input)
+
+                logits = output[0].squeeze().detach().cpu().numpy()
+
+                for chunk_mask_pos in chunk_mask_positions:
+                    if chunk_mask_pos < 0 or chunk_mask_pos >= logits.shape[0]:
+                        continue
+                    mask_logits_chunk = logits[chunk_mask_pos]
+                    aggregated_logits = (
+                        mask_logits_chunk.copy()
+                        if aggregated_logits is None
+                        else aggregated_logits + mask_logits_chunk
+                    )
+                    mask_count += 1
+        except Exception as exc:  # pragma: no cover - defensive safety net
+            logger.debug("Chunked inference failed; falling back to truncation: %s", exc)
+            chunked_inputs = []
+
+        if aggregated_logits is None or mask_count == 0:
+            truncated_ids = input_ids[-max_len:]
+            try:
+                fallback_mask_pos = truncated_ids.index(tokenizer.mask_token_id)
+            except ValueError:
+                return ""
+
+            model_input = torch.tensor(truncated_ids).reshape(1, -1).to(self.device)
+
+            with torch.no_grad():
+                output = lm_model(model_input)
+
+            logits = output[0].squeeze().detach().cpu().numpy()
+            mask_logits = logits[fallback_mask_pos]
+        else:
+            mask_logits = aggregated_logits / mask_count
+
+        if use_temperature:
             temperature = self.core._calculate_temperature(epsilon)
             mask_logits = np.clip(mask_logits, self.config.clip_min, self.config.clip_max)
             mask_logits = mask_logits / temperature
@@ -450,13 +701,211 @@ class DPMLMPrivatizer(DPMechanism):
             chosen_idx = np.random.choice(len(mask_logits), p=scores.numpy())
             return tokenizer.decode(chosen_idx).strip()
         else:
-            top_tokens = torch.topk(torch.from_numpy(mask_logits), k=self.config.k_candidates, dim=0)[1]
+            top_tokens = torch.topk(torch.from_numpy(mask_logits), k=k_candidates, dim=0)[1]
             return tokenizer.decode(top_tokens[0].item()).strip()
 
+    # ------------------------------------------------------------------
+    # Strategy factory helpers
+    # ------------------------------------------------------------------
+    def _build_selection_strategy(self) -> TokenSelectionStrategy:
+        if self.config.process_pii_only:
+            return PIITokenSelection(annotator=self.settings.annotator, threshold=self.settings.pii_threshold)
+        return AllTokensSelection()
 
-# Factory function for easy instantiation
-def create_dpmlm_privatizer(config: Optional[DPMLMConfig] = None, annotator=None) -> DPMLMPrivatizer:
-    """Create a DPMLM privatizer with optional configuration."""
-    if config is None:
-        config = DPMLMConfig()
-    return DPMLMPrivatizer(config, annotator)
+    def _build_scoring_strategy(self) -> ScoringStrategy:
+        mode = (self.settings.explainability_mode or "uniform").lower()
+        if mode == "greedy":
+            return GreedyScoring()
+        if mode == "shap":
+            return ShapScoring()
+        return UniformScoring()
+
+    # ------------------------------------------------------------------
+    # Weight computation and allocations
+    # ------------------------------------------------------------------
+    def _compute_ranking_weights(self, scores: np.ndarray) -> np.ndarray:
+        if scores.size == 0:
+            return scores
+
+        clipped = scores.astype(float)
+        if self.settings.clip_contribution is not None:
+            clipped = np.clip(clipped, 0.0, self.settings.clip_contribution)
+
+        positive = np.maximum(clipped, self.settings.min_weight)
+        total = float(positive.sum())
+        if total <= 0.0:
+            ranking = np.full_like(positive, 1.0 / positive.size)
+        else:
+            ranking = positive / total
+
+        if self.settings.top_k is not None and self.settings.top_k < ranking.size:
+            top_indices = np.argsort(ranking)[::-1][: self.settings.top_k]
+            mask = np.zeros_like(ranking)
+            mask[top_indices] = 1.0
+            masked = ranking * mask
+            masked_sum = masked.sum()
+            ranking = masked / masked_sum if masked_sum > 0 else np.full_like(ranking, 1.0 / ranking.size)
+
+        return ranking
+
+    def _compute_privacy_epsilons(self, ranking_weights: np.ndarray, epsilon: float) -> np.ndarray:
+        if ranking_weights.size == 0:
+            return ranking_weights
+
+        denom = np.maximum(ranking_weights, self.settings.min_weight)
+        scale = denom * max(len(ranking_weights), 1)
+        eps_values = epsilon / scale
+        max_eps = epsilon * max(len(ranking_weights), 1)
+        eps_values = np.clip(eps_values, self.settings.min_weight, max_eps)
+        return eps_values
+
+    def _build_allocations(
+        self,
+        spans: List[TokenSpan],
+        scores: np.ndarray,
+        ranking_weights: np.ndarray,
+        epsilon: float,
+    ) -> List[TokenRiskAllocation]:
+        if not spans:
+            return []
+
+        if ranking_weights.size != len(spans):
+            ranking_weights = np.full(len(spans), 1.0 / max(len(spans), 1))
+
+        epsilon_values = self._compute_privacy_epsilons(ranking_weights, epsilon)
+
+        return [
+            TokenRiskAllocation(
+                span=span,
+                score=float(score),
+                weight=float(weight),
+                epsilon=float(token_eps),
+            )
+            for span, score, weight, token_eps in zip(spans, scores, ranking_weights, epsilon_values)
+        ]
+
+    # ------------------------------------------------------------------
+    # Helpers bridging to scoring strategies
+    # ------------------------------------------------------------------
+    def _resolve_label_index(self, pipeline: Any, text: str) -> int:
+        label_setting = self.settings.explainability_label
+        model = getattr(pipeline, "model", None)
+        config = getattr(model, "config", None)
+        label2id = getattr(config, "label2id", {}) if config else {}
+        id2label = getattr(config, "id2label", {}) if config else {}
+
+        if isinstance(label_setting, int):
+            return label_setting
+
+        if isinstance(label_setting, str):
+            key = label_setting.lower()
+            if label2id:
+                lookup = {k.lower(): v for k, v in label2id.items()}
+                return lookup.get(key, 0)
+            for idx, name in id2label.items():
+                if name.lower() == key:
+                    return int(idx)
+            return 0
+
+        prediction = pipeline(text, truncation=True)
+        if isinstance(prediction, list) and prediction:
+            top = prediction[0]
+            label_name = top.get("label") if isinstance(top, dict) else None
+            if label_name and label2id:
+                lookup = {k.lower(): v for k, v in label2id.items()}
+                return lookup.get(label_name.lower(), 0)
+            if label_name and id2label:
+                for idx, name in id2label.items():
+                    if name.lower() == label_name.lower():
+                        return int(idx)
+
+        if config and hasattr(config, "num_labels"):
+            return int(getattr(config, "num_labels") // 2)
+        return 0
+
+    def _label_probability(self, pipeline: Any, text: str, label_index: int) -> Optional[float]:
+        try:
+            predictions = pipeline(text, return_all_scores=True, truncation=True)
+        except TypeError:
+            predictions = pipeline(text, truncation=True)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Risk pipeline inference failed: %s", exc)
+            return None
+
+        if not predictions:
+            return None
+
+        scores = predictions[0]
+        model = getattr(pipeline, "model", None)
+        config = getattr(model, "config", None)
+        id2label = getattr(config, "id2label", {}) if config else {}
+
+        if isinstance(scores, list) and scores and isinstance(scores[0], dict):
+            if id2label:
+                target_label = id2label.get(label_index) or id2label.get(str(label_index))
+                if target_label is not None:
+                    for entry in scores:
+                        if entry.get("label") == target_label:
+                            return float(entry.get("score", 0.0))
+            if 0 <= label_index < len(scores):
+                return float(scores[label_index].get("score", 0.0))
+            return float(scores[0].get("score", 0.0))
+
+        if isinstance(scores, dict):
+            return float(scores.get(label_index, 0.0))
+
+        if isinstance(scores, list) and scores and np.isscalar(scores[0]):
+            if 0 <= label_index < len(scores):
+                return float(scores[label_index])
+
+        return None
+
+    def _mask_span(self, text: str, span: TokenSpan, mask_text: str) -> str:
+        return text[: span.start] + mask_text + text[span.end :]
+
+    def _terms_to_tokens(self, text: str, spans: List[TokenSpan], tokenizer: Any) -> List[List[int]]:
+        if not spans:
+            return []
+
+        encoded = tokenizer(
+            text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        offsets = encoded.get("offset_mapping", [])
+        terms_to_tokens: List[List[int]] = []
+        last_idx = 0
+
+        for span in spans:
+            start, end = span.start, span.end
+            token_indices: List[int] = []
+            for token_idx in range(last_idx, len(offsets)):
+                token_start, token_end = offsets[token_idx]
+                if token_end <= start:
+                    continue
+                if token_start >= end:
+                    last_idx = token_idx
+                    break
+                token_indices.append(token_idx)
+            else:
+                last_idx = len(offsets)
+            terms_to_tokens.append(token_indices)
+
+        return terms_to_tokens
+
+    def _ensure_shap_explainer(self, pipeline: Any):
+        if self._shap_explainer is not None:
+            return self._shap_explainer
+
+        try:
+            import shap  # type: ignore
+        except ImportError:
+            logger.warning("SHAP library not available; scoring falls back to uniform weights.")
+            return None
+
+        try:
+            self._shap_explainer = shap.Explainer(pipeline, silent=self.settings.shap_silent)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to initialise SHAP explainer: %s", exc)
+            self._shap_explainer = None
+        return self._shap_explainer

@@ -94,7 +94,6 @@ class DPMLMModelManager(ModelManager):
             cache_dir=self.config.cache_dir
         )
         
-        # Load both masked LM and raw models
         lm_model = AutoModelForMaskedLM.from_pretrained(
             self.config.model_name,
             cache_dir=self.config.cache_dir
@@ -107,7 +106,6 @@ class DPMLMModelManager(ModelManager):
             cache_dir=self.config.cache_dir
         ).to(self.device)
         
-        # Return both models as a tuple
         return (lm_model, raw_model), tokenizer
 
 

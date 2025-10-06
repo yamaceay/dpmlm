@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class BaseConfig:
     """Base configuration class with common parameters."""
     epsilon: float = 1.0
-    device: str = "auto"  # "auto", "cuda", "cpu", "mps"
+    device: str = "auto"  
     seed: Optional[int] = 42
     verbose: bool = False
     
@@ -54,16 +54,16 @@ class DPMLMConfig(BaseConfig):
     """Configuration for DPMLM mechanism."""
     model_config: ModelConfig = field(default_factory=ModelConfig)
     
-    # Core DPMLM parameters
+    
     alpha: float = 0.003
     clip_min: float = -3.2093127
     clip_max: float = 16.304797887802124
     
-    # Tokenization parameters
+    
     use_treebank_tokenizer: bool = True
     preserve_case: bool = True
     
-    # Processing parameters
+    
     k_candidates: int = 5
     filter_words: bool = True
     use_pos_tags: bool = True
@@ -71,17 +71,17 @@ class DPMLMConfig(BaseConfig):
     english_only: bool = True
     use_temperature: bool = True
     
-    # Patch-specific parameters
+    
     process_pii_only: bool = True
     annotator_config: Optional[Dict[str, Any]] = None
     
-    # Plus method parameters
+    
     add_probability: float = 0.15
     delete_probability: float = 0.05
-    
+
     def __post_init__(self):
         """Post-initialization processing."""
-        # Convert dict to ModelConfig if necessary
+        
         if isinstance(self.model_config, dict):
             self.model_config = ModelConfig(**self.model_config)
         elif self.model_config is None:
@@ -118,22 +118,22 @@ class DPPromptConfig(BaseConfig):
         max_sequence_length=512
     ))
     
-    # Logit clipping parameters
+    
     min_logit: float = -19.22705113016047
     max_logit: float = 7.48324937989716
     
-    # Generation parameters
-    max_new_tokens: Optional[int] = None  # If None, uses input length
+    
+    max_new_tokens: Optional[int] = None  
     top_k: int = 0
     top_p: float = 1.0
     do_sample: bool = True
     
-    # Prompt template
+    
     prompt_template: str = "Document : {}\nParaphrase of the document :"
     
     def __post_init__(self):
         """Post-initialization processing."""
-        # Convert dict to ModelConfig if necessary
+        
         if isinstance(self.model_config, dict):
             self.model_config = ModelConfig(**self.model_config)
         elif self.model_config is None:
@@ -169,20 +169,20 @@ class DPParaphraseConfig(BaseConfig):
         max_sequence_length=512
     ))
     
-    # Logit clipping parameters  
+    
     min_logit: float = -96.85249956065758
     max_logit: float = -8.747697966442914
     
-    # Generation parameters
-    max_new_tokens: Optional[int] = None  # If None, uses input length
     
-    # Prompt formatting
+    max_new_tokens: Optional[int] = None  
+    
+    
     prompt_suffix: str = " >>>>> "
     output_cleanup_chars: List[str] = field(default_factory=lambda: [">", "\xa0"])
     
     def __post_init__(self):
         """Post-initialization processing."""
-        # Convert dict to ModelConfig if necessary
+        
         if isinstance(self.model_config, dict):
             self.model_config = ModelConfig(**self.model_config)
         elif self.model_config is None:
@@ -216,15 +216,15 @@ class DPBartConfig(BaseConfig):
         max_sequence_length=512
     ))
     
-    # Noise parameters
+    
     sigma: float = 0.2
     num_sigmas: float = 0.5
     delta: float = 1e-5
     
-    # Noise methods
-    noise_method: str = "gaussian"  # "gaussian", "laplace", "analytic_gaussian"
     
-    # Precision parameters for analytic Gaussian
+    noise_method: str = "gaussian"  
+    
+    
     analytic_tolerance: float = 1e-12
     precision_dps: Dict[str, int] = field(default_factory=lambda: {
         "1000": 500,
@@ -234,7 +234,7 @@ class DPBartConfig(BaseConfig):
     
     def __post_init__(self):
         """Post-initialization processing."""
-        # Convert dict to ModelConfig if necessary
+        
         if isinstance(self.model_config, dict):
             self.model_config = ModelConfig(**self.model_config)
         elif self.model_config is None:
@@ -288,7 +288,7 @@ class AnnotatorConfig:
             raise ValueError("unique_labels cannot be empty")
 
 
-# Configuration factory functions
+
 def create_dpmlm_config(**kwargs) -> DPMLMConfig:
     """Create DPMLM configuration with custom parameters."""
     return DPMLMConfig(**kwargs)
