@@ -161,14 +161,12 @@ class DPMLMRewriteSettings:
     pii_threshold: float = 0.0
     min_weight: float = 1e-6
     maintain_expected_noise: bool = True
-    top_k: Optional[int] = None
     clip_contribution: Optional[float] = None
     explainability_mode: str = "uniform"
     explainability_label: Optional[Any] = None
-    mask_text: str = "<mask>"
+    mask_text: str = "[MASK]"
     shap_silent: bool = True
     shap_batch_size: int = 1
-    summary_top_k: int = 10
 
 
 class TokenSelectionStrategy(ABC):
@@ -408,6 +406,8 @@ class DPMLMMechanism(DPMechanism):
             text,
         )
         critical_spans = [span for span in spans if span.is_critical]
+        selected_ratio = len(critical_spans) / len(spans)
+        scaled_epsilon = epsilon * selected_ratio if self.settings.maintain_expected_noise else epsilon
         logger.info("Identified %d critical spans out of %d total tokens.", len(critical_spans), len(spans))
         if len(critical_spans) == 0:
             logger.info("No critical spans identified; returning original text.")
@@ -430,7 +430,17 @@ class DPMLMMechanism(DPMechanism):
             raise ValueError("Scoring strategy returned invalid number of scores.")
 
         ranking_weights = self._compute_ranking_weights(scores)
-        allocations = self._build_allocations(critical_spans, scores, ranking_weights, epsilon)
+        epsilon_values = self._compute_privacy_epsilons(ranking_weights, scaled_epsilon)
+
+        allocations = [
+            TokenRiskAllocation(
+                span=span,
+                score=float(score),
+                weight=float(weight),
+                epsilon=float(token_eps),
+            )
+            for span, score, weight, token_eps in zip(critical_spans, scores, ranking_weights, epsilon_values)
+        ]
         allocations.sort(key=lambda alloc: (alloc.weight, alloc.score), reverse=True)
 
         token_eps_map = {
@@ -473,7 +483,7 @@ class DPMLMMechanism(DPMechanism):
                     continue
                 
                 span_key = (span.start, span.end)
-                local_epsilon = token_eps_map.get(span_key) if token_eps_map else epsilon
+                local_epsilon = token_eps_map[span_key]
                 if not local_epsilon or local_epsilon <= 0:
                     local_epsilon = epsilon
 
@@ -538,10 +548,6 @@ class DPMLMMechanism(DPMechanism):
 
         token_allocations = [alloc.to_metadata(idx + 1) for idx, alloc in enumerate(allocations)]
         result.metadata["token_allocations"] = token_allocations
-
-        top_k = min(self.settings.summary_top_k, len(token_allocations))
-        if top_k > 0:
-            result.metadata["token_allocations_summary"] = token_allocations[:top_k]
 
         return result
     
@@ -749,14 +755,6 @@ class DPMLMMechanism(DPMechanism):
         else:
             ranking = positive / total
 
-        if self.settings.top_k is not None and self.settings.top_k < ranking.size:
-            top_indices = np.argsort(ranking)[::-1][: self.settings.top_k]
-            mask = np.zeros_like(ranking)
-            mask[top_indices] = 1.0
-            masked = ranking * mask
-            masked_sum = masked.sum()
-            ranking = masked / masked_sum if masked_sum > 0 else np.full_like(ranking, 1.0 / ranking.size)
-
         return ranking
 
     def _compute_privacy_epsilons(self, ranking_weights: np.ndarray, epsilon: float) -> np.ndarray:
@@ -766,30 +764,6 @@ class DPMLMMechanism(DPMechanism):
         max_eps = epsilon * max(len(ranking_weights), 1)
         eps_values = np.clip(eps_values, self.settings.min_weight, max_eps)
         return eps_values
-
-    def _build_allocations(
-        self,
-        spans: List[TokenSpan],
-        scores: np.ndarray,
-        ranking_weights: np.ndarray,
-        epsilon: float,
-    ) -> List[TokenRiskAllocation]:
-        if not spans:
-            return []
-        
-        assert len(spans) == len(scores) == len(ranking_weights), "Mismatched lengths in allocations."
-
-        epsilon_values = self._compute_privacy_epsilons(ranking_weights, epsilon)
-
-        return [
-            TokenRiskAllocation(
-                span=span,
-                score=float(score),
-                weight=float(weight),
-                epsilon=float(token_eps),
-            )
-            for span, score, weight, token_eps in zip(spans, scores, ranking_weights, epsilon_values)
-        ]
 
     # ------------------------------------------------------------------
     # Helpers bridging to scoring strategies
