@@ -204,7 +204,7 @@ class PIITokenSelection(TokenSelectionStrategy):
         annotator = self._annotator
         if annotator is None:
             raise ValueError(
-                "PII token selection requested but no annotator provided; falling back to baseline selection."
+                "PII token selection requested but no annotator provided."
             )
 
         predictions = annotator.predict(text)
@@ -228,8 +228,8 @@ class PIITokenSelection(TokenSelectionStrategy):
                     span.entity_type = entity_group
 
         if not any(span.is_critical for span in spans):
-            logger.debug("No PII spans detected; defaulting to baseline selection.")
-            return AllTokensSelection().mark(spans, text)
+            logger.debug("No PII spans detected.")
+            raise ValueError("No PII spans detected.")
 
         return spans
 
@@ -273,14 +273,14 @@ class GreedyScoring(ScoringStrategy):
     def score(self, text: str, spans: List[TokenSpan], context: ScoringContext) -> np.ndarray:
         pipeline = context.risk_settings.risk_pipeline
         if pipeline is None or not spans:
-            logger.debug("Greedy scoring requested without pipeline; reverting to uniform weights.")
-            return np.ones(len(spans), dtype=float)
+            logger.debug("Greedy scoring requested without pipeline.")
+            raise ValueError("Greedy scoring requires a risk pipeline.")
 
         label_index = context.mechanism._resolve_label_index(pipeline, text)
         base_prob = context.mechanism._label_probability(pipeline, text, label_index)
         if base_prob is None:
-            logger.debug("Failed to obtain base probability for greedy scoring; using uniform weights.")
-            return np.ones(len(spans), dtype=float)
+            logger.debug("Failed to obtain base probability for greedy scoring.")
+            raise ValueError("Greedy scoring requires a valid base probability.")
 
         scores: List[float] = []
         mask_text = context.risk_settings.mask_text
@@ -295,7 +295,7 @@ class GreedyScoring(ScoringStrategy):
         scores_array = np.array(scores, dtype=float)
         if np.allclose(scores_array, 0.0):
             logger.debug("Greedy scores collapsed to zero; returning uniform weights.")
-            return np.ones(len(spans), dtype=float)
+            raise ValueError("Greedy scoring resulted in zero scores.")
         return scores_array
 
 
@@ -306,32 +306,32 @@ class ShapScoring(ScoringStrategy):
     def score(self, text: str, spans: List[TokenSpan], context: ScoringContext) -> np.ndarray:
         pipeline = context.risk_settings.risk_pipeline
         if pipeline is None or not spans:
-            logger.debug("SHAP scoring requested without pipeline; reverting to uniform weights.")
-            return np.ones(len(spans), dtype=float)
+            logger.debug("SHAP scoring requested without pipeline.")
+            raise ValueError("SHAP scoring requires a risk pipeline.")
 
         explainer = context.mechanism._ensure_shap_explainer(pipeline)
         if explainer is None:
-            logger.debug("Unable to initialise SHAP explainer; using uniform weights.")
-            return np.ones(len(spans), dtype=float)
+            logger.debug("Unable to initialise SHAP explainer.")
+            raise ValueError("SHAP scoring requires a valid explainer.")
 
         try:
             shap_values = explainer([text], batch_size=context.risk_settings.shap_batch_size)
         except TypeError:
             shap_values = explainer([text])
         except Exception as exc:  # pragma: no cover
-            logger.warning("Failed to compute SHAP values (%s); using uniform weights.", exc)
-            return np.ones(len(spans), dtype=float)
+            logger.warning("Failed to compute SHAP values (%s).", exc)
+            raise ValueError("SHAP scoring requires valid SHAP values.")
 
         if not hasattr(shap_values, "values"):
-            logger.debug("SHAP values object missing 'values'; using uniform weights.")
-            return np.ones(len(spans), dtype=float)
+            logger.debug("SHAP explainer did not return values.")
+            raise ValueError("SHAP explainer did not return values.")
 
         label_index = context.mechanism._resolve_label_index(pipeline, text)
         token_weights = shap_values.values[0, :, label_index]
         tokenizer = getattr(pipeline, "tokenizer", None)
         if tokenizer is None:
-            logger.debug("Risk pipeline lacks tokenizer; SHAP scoring falls back to uniform weights.")
-            return np.ones(len(spans), dtype=float)
+            logger.debug("Risk pipeline lacks tokenizer.")
+            raise ValueError("SHAP scoring requires a tokenizer in the risk pipeline.")
 
         term_to_token = context.mechanism._terms_to_tokens(text, spans, tokenizer)
         scores: List[float] = []
@@ -348,8 +348,8 @@ class ShapScoring(ScoringStrategy):
 
         scores_array = np.array(scores, dtype=float)
         if np.allclose(scores_array, 0.0):
-            logger.debug("SHAP scores collapsed to zero; defaulting to uniform weights.")
-            return np.ones(len(spans), dtype=float)
+            logger.debug("SHAP scores collapsed to zeros.")
+            raise ValueError("SHAP scoring resulted in zero scores.")
         return scores_array
 
 
@@ -408,6 +408,17 @@ class DPMLMMechanism(DPMechanism):
             text,
         )
         critical_spans = [span for span in spans if span.is_critical]
+        logger.info("Identified %d critical spans out of %d total tokens.", len(critical_spans), len(spans))
+        if len(critical_spans) == 0:
+            logger.info("No critical spans identified; returning original text.")
+            return PrivacyResult(
+                original_text=text,
+                private_text=text,
+                perturbed_tokens=0,
+                total_tokens=len(spans),
+                added_tokens=0,
+                deleted_tokens=0
+            )
 
         context = ScoringContext(
             risk_settings=self.settings,
@@ -415,7 +426,8 @@ class DPMLMMechanism(DPMechanism):
         )
         scores = self.scoring_strategy.score(text, critical_spans, context)
         if scores.size != len(critical_spans):
-            scores = np.ones(len(critical_spans), dtype=float)
+            logger.debug("Scoring strategy returned invalid number of scores: %d out of %d.", scores.size, len(critical_spans))
+            raise ValueError("Scoring strategy returned invalid number of scores.")
 
         ranking_weights = self._compute_ranking_weights(scores)
         allocations = self._build_allocations(critical_spans, scores, ranking_weights, epsilon)
@@ -724,8 +736,7 @@ class DPMLMMechanism(DPMechanism):
     # Weight computation and allocations
     # ------------------------------------------------------------------
     def _compute_ranking_weights(self, scores: np.ndarray) -> np.ndarray:
-        if scores.size == 0:
-            return scores
+        assert len(scores) > 0, "No scores provided for ranking weights."
 
         clipped = scores.astype(float)
         if self.settings.clip_contribution is not None:
@@ -749,9 +760,6 @@ class DPMLMMechanism(DPMechanism):
         return ranking
 
     def _compute_privacy_epsilons(self, ranking_weights: np.ndarray, epsilon: float) -> np.ndarray:
-        if ranking_weights.size == 0:
-            return ranking_weights
-
         denom = np.maximum(ranking_weights, self.settings.min_weight)
         scale = denom * max(len(ranking_weights), 1)
         eps_values = epsilon / scale
@@ -768,9 +776,8 @@ class DPMLMMechanism(DPMechanism):
     ) -> List[TokenRiskAllocation]:
         if not spans:
             return []
-
-        if ranking_weights.size != len(spans):
-            ranking_weights = np.full(len(spans), 1.0 / max(len(spans), 1))
+        
+        assert len(spans) == len(scores) == len(ranking_weights), "Mismatched lengths in allocations."
 
         epsilon_values = self._compute_privacy_epsilons(ranking_weights, epsilon)
 
