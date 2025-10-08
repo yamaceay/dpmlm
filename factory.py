@@ -5,23 +5,17 @@ This module provides a unified interface for creating different types
 of DP mechanisms with proper configuration management.
 """
 
+import copy
 import logging
 from typing import Dict, Any, List, Optional
 from dpmlm.interfaces import DPMechanism
 from dpmlm.config import (
-    DPMLMConfig, DPPromptConfig, DPParaphraseConfig, DPBartConfig,
-    create_dpmlm_config, create_dpprompt_config, 
-    create_dpparaphrase_config, create_dpbart_config
+    DPMLMConfig,
+    DPPromptConfig,
+    DPParaphraseConfig,
+    DPBartConfig,
 )
-from dpmlm.core import (
-    DPMLMRewriteSettings,
-    DPMLMMechanism,
-    AllTokensSelection,
-    PIITokenSelection,
-    UniformScoring,
-    GreedyScoring,
-    ShapScoring,
-)
+from dpmlm.core import DPMLMMechanism
 
 logger = logging.getLogger(__name__)
 
@@ -65,51 +59,40 @@ class DPMechanismFactory:
     def _create_dpmlm(self, config: Optional[Dict[str, Any]]) -> DPMechanism:
         """Create risk-aware DPMLM rewrite mechanism."""
 
-        config = config or {}
-
-        # Support both a nested configuration dict and a flat DPMLM config.
-        has_nested = any(key in config for key in ("dpmlm", "dpmlm_config", "risk", "risk_settings", "risk_config"))
-
-        if has_nested:
-            dp_payload = config.get("dpmlm") or config.get("dpmlm_config") or {}
-            risk_payload = config.get("risk") or config.get("risk_settings") or config.get("risk_config") or {}
+        if isinstance(config, DPMLMConfig):
+            dp_config = config
         else:
-            dp_payload = config
-            risk_payload = {}
+            config_dict = dict(config or {})
 
-        if dp_payload:
-            dp_config = create_dpmlm_config(**dp_payload)
-        else:
-            dp_config = DPMLMConfig()
+            generic_payload = config_dict.get("generic", {})
+            runtime_payload = config_dict.get("runtime", {})
 
-        risk_settings = DPMLMRewriteSettings(**risk_payload) if risk_payload else DPMLMRewriteSettings()
+            if any(
+                key in config_dict
+                for key in ("dpmlm", "dpmlm_config", "risk", "risk_settings", "risk_config")
+            ):
+                model_payload = config_dict.get("dpmlm") or config_dict.get("dpmlm_config") or {}
+                risk_payload = (
+                    config_dict.get("risk")
+                    or config_dict.get("risk_settings")
+                    or config_dict.get("risk_config")
+                    or {}
+                )
+                model_payload = {**model_payload, **risk_payload}
+            else:
+                model_payload = config_dict.get("model") or {
+                    key: value
+                    for key, value in config_dict.items()
+                    if key not in {"generic", "runtime"}
+                }
 
-        annotator_obj = risk_settings.annotator
+            dp_config = DPMLMConfig(
+                generic=generic_payload,
+                model=model_payload,
+                runtime=runtime_payload,
+            )
 
-        if annotator_obj is not None and risk_settings.annotator is None:
-            risk_settings.annotator = annotator_obj
-
-        if dp_config.process_pii_only:
-            selection_strategy = PIITokenSelection(annotator=annotator_obj, threshold=risk_settings.pii_threshold)
-        else:
-            selection_strategy = AllTokensSelection()
-
-        mode = (risk_settings.explainability_mode or "uniform").lower()
-        if mode == "greedy":
-            scoring_strategy = GreedyScoring()
-        elif mode == "shap":
-            scoring_strategy = ShapScoring()
-        else:
-            scoring_strategy = UniformScoring()
-
-        risk_settings.annotator = annotator_obj
-
-        return DPMLMMechanism(
-            config=dp_config,
-            settings=risk_settings,
-            selection_strategy=selection_strategy,
-            scoring_strategy=scoring_strategy,
-        )
+        return DPMLMMechanism(config=dp_config)
 
     def _create_dpprompt(self, config: Optional[Dict[str, Any]]) -> DPMechanism:  
         """Create DPPrompt mechanism."""
@@ -119,10 +102,10 @@ class DPMechanismFactory:
             logger.error("Failed to import DPPromptPrivatizer: %s", e)
             raise ImportError("DPPrompt dependencies not available") from e
         
-        if config is None:
-            dp_config = DPPromptConfig()
+        if isinstance(config, DPPromptConfig):
+            dp_config = config
         else:
-            dp_config = create_dpprompt_config(**config)
+            dp_config = DPPromptConfig(**(config or {}))
         
         return DPPromptPrivatizer(dp_config)
     
@@ -134,10 +117,10 @@ class DPMechanismFactory:
             logger.error("Failed to import DPParaphrasePrivatizer: %s", e)
             raise ImportError("DPParaphrase dependencies not available") from e
         
-        if config is None:
-            dp_config = DPParaphraseConfig()
+        if isinstance(config, DPParaphraseConfig):
+            dp_config = config
         else:
-            dp_config = create_dpparaphrase_config(**config)
+            dp_config = DPParaphraseConfig(**(config or {}))
         
         return DPParaphrasePrivatizer(dp_config)
     
@@ -149,10 +132,10 @@ class DPMechanismFactory:
             logger.error("Failed to import DPBartPrivatizer: %s", e)
             raise ImportError("DPBart dependencies not available") from e
         
-        if config is None:
-            dp_config = DPBartConfig()
+        if isinstance(config, DPBartConfig):
+            dp_config = config
         else:
-            dp_config = create_dpbart_config(**config)
+            dp_config = DPBartConfig(**(config or {}))
         
         return DPBartPrivatizer(dp_config)
 
@@ -166,25 +149,30 @@ class ConfigurableDPFactory:
             "dpmlm_basic": {
                 "type": "dpmlm",
                 "config": {
-                    "epsilon": 1.0,
-                    "use_temperature": True,
-                    "process_pii_only": False
+                    "model": {
+                        "use_temperature": True,
+                        "process_pii_only": False,
+                    }
                 }
             },
             "dpmlm_pii_focused": {
                 "type": "dpmlm", 
                 "config": {
-                    "epsilon": 1.0,
-                    "use_temperature": True,
-                    "process_pii_only": True
+                    "model": {
+                        "use_temperature": True,
+                        "process_pii_only": True,
+                    }
                 }
             },
             "dpmlm_high_privacy": {
                 "type": "dpmlm",
                 "config": {
-                    "epsilon": 0.1,
-                    "use_temperature": True,
-                    "process_pii_only": True
+                    "model": {
+                        "use_temperature": True,
+                        "process_pii_only": True,
+                        "add_probability": 0.0,
+                        "delete_probability": 0.0,
+                    }
                 }
             },
             "dpprompt_default": {
@@ -232,11 +220,15 @@ class ConfigurableDPFactory:
         
         preset = self._presets[preset_name].copy()
         mechanism_type = preset["type"]
-        config = preset["config"].copy()
-        
-        
+        config = copy.deepcopy(preset["config"])
+
         if override_config:
-            config.update(override_config)
+            for key, value in override_config.items():
+                if key in {"model", "generic", "runtime"} and isinstance(value, dict):
+                    section = config.setdefault(key, {})
+                    section.update(value)
+                else:
+                    config[key] = value
         
         logger.info("Creating mechanism from preset: %s", preset_name)
         return self.base_factory.create_mechanism(mechanism_type, config)
@@ -296,18 +288,30 @@ def list_presets() -> List[str]:
 
 
 
-def build_dpmlm_config(epsilon: float = 1.0, process_pii_only: bool = True,
-                      model_name: str = "roberta-base", **kwargs) -> Dict[str, Any]:
-    """Build DPMLM configuration with common parameters."""
-    config = {
-        "epsilon": epsilon,
+def build_dpmlm_config(
+    process_pii_only: bool = True,
+    model_name: str = "roberta-base",
+    **model_overrides: Any,
+) -> Dict[str, Any]:
+    """Build a DPMLM configuration payload using the new categorical layout."""
+
+    model_section: Dict[str, Any] = {
         "process_pii_only": process_pii_only,
-        "model_config": {
-            "model_name": model_name
-        }
+        "model": {
+            "model_name": model_name,
+        },
     }
-    config.update(kwargs)
-    return config
+
+    transformer_overrides = model_overrides.pop("model", None) or model_overrides.pop(
+        "model_config", None
+    )
+    if transformer_overrides:
+        if not isinstance(transformer_overrides, dict):
+            raise TypeError("model overrides must be provided as a dictionary")
+        model_section["model"].update(transformer_overrides)
+
+    model_section.update(model_overrides)
+    return {"model": model_section}
 
 
 def build_dpprompt_config(epsilon: float = 1.0, model_name: str = "google/flan-t5-base",

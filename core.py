@@ -16,7 +16,7 @@ from collections import Counter
 from abc import ABC, abstractmethod
 
 from dpmlm.interfaces import DPMechanism, PrivacyResult, TokenSpan, DPTokenizer
-from dpmlm.config import DPMLMConfig
+from dpmlm.config import DPMLMConfig, DPMLMModelConfig
 from dpmlm.resources import DPMLMModelManager
 
 logger = logging.getLogger(__name__)
@@ -70,8 +70,9 @@ class DPMLMTokenizer:
 class DPMLMCore:
     """Core DPMLM functionality with clean interface."""
     
-    def __init__(self, config: DPMLMConfig):
+    def __init__(self, config: DPMLMModelConfig, device_preference: str = "auto"):
         self.config = config
+        self.device_preference = device_preference
         self.tokenizer_wrapper = DPMLMTokenizer(config.use_treebank_tokenizer)
         self._validate_config()
         
@@ -81,15 +82,15 @@ class DPMLMCore:
         logger.info("DPMLM configuration validated")
         
     def _get_device(self) -> torch.device:
-        """Get appropriate device."""
-        if self.config.device == "auto":
+        """Get appropriate device based on preference and availability."""
+        preference = self.device_preference
+        if preference == "auto":
             if torch.backends.mps.is_available():
                 return torch.device("mps")
-            elif torch.cuda.is_available():
+            if torch.cuda.is_available():
                 return torch.device("cuda")
-            else:
-                return torch.device("cpu")
-        return torch.device(self.config.device)
+            return torch.device("cpu")
+        return torch.device(preference)
     
     def _sentence_enum(self, tokens: List[str]) -> List[int]:
         """Enumerate token occurrences."""
@@ -134,7 +135,7 @@ class DPMLMCore:
         mask_positions: List[int],
     ) -> List[Tuple[List[int], List[int]]]:
         """Return a single truncated window containing the mask token."""
-        max_len = self.config.model_config.max_sequence_length
+        max_len = self.config.model.max_sequence_length
 
         if len(input_ids) <= max_len:
             return [(input_ids, mask_positions)]
@@ -150,23 +151,6 @@ class DPMLMCore:
 # ---------------------------------------------------------------------------
 # Strategy-based DPMLM rewriting
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class DPMLMRewriteSettings:
-    """Configuration for risk-aware rewriting behaviour."""
-
-    risk_pipeline: Optional[Any] = None
-    annotator: Optional[Any] = None
-    pii_threshold: float = 0.0
-    min_weight: float = 1e-6
-    maintain_expected_noise: bool = True
-    clip_contribution: Optional[float] = None
-    explainability_mode: str = "uniform"
-    explainability_label: Optional[Any] = None
-    mask_text: str = "[MASK]"
-    shap_silent: bool = True
-    shap_batch_size: int = 1
 
 
 class TokenSelectionStrategy(ABC):
@@ -234,7 +218,7 @@ class PIITokenSelection(TokenSelectionStrategy):
 
 @dataclass
 class ScoringContext:
-    risk_settings: DPMLMRewriteSettings
+    model_config: DPMLMModelConfig
     mechanism: "DPMLMMechanism"
 
 
@@ -269,7 +253,7 @@ class GreedyScoring(ScoringStrategy):
         super().__init__(name="greedy")
 
     def score(self, text: str, spans: List[TokenSpan], context: ScoringContext) -> np.ndarray:
-        pipeline = context.risk_settings.risk_pipeline
+        pipeline = context.model_config.risk_pipeline
         if pipeline is None or not spans:
             logger.debug("Greedy scoring requested without pipeline.")
             raise ValueError("Greedy scoring requires a risk pipeline.")
@@ -281,7 +265,7 @@ class GreedyScoring(ScoringStrategy):
             raise ValueError("Greedy scoring requires a valid base probability.")
 
         scores: List[float] = []
-        mask_text = context.risk_settings.mask_text
+        mask_text = context.model_config.mask_text
         for span in spans:
             masked_text = context.mechanism._mask_span(text, span, mask_text)
             prob = context.mechanism._label_probability(pipeline, masked_text, label_index)
@@ -302,7 +286,7 @@ class ShapScoring(ScoringStrategy):
         super().__init__(name="shap")
 
     def score(self, text: str, spans: List[TokenSpan], context: ScoringContext) -> np.ndarray:
-        pipeline = context.risk_settings.risk_pipeline
+        pipeline = context.model_config.risk_pipeline
         if pipeline is None or not spans:
             logger.debug("SHAP scoring requested without pipeline.")
             raise ValueError("SHAP scoring requires a risk pipeline.")
@@ -313,7 +297,7 @@ class ShapScoring(ScoringStrategy):
             raise ValueError("SHAP scoring requires a valid explainer.")
 
         try:
-            shap_values = explainer([text], batch_size=context.risk_settings.shap_batch_size)
+            shap_values = explainer([text], batch_size=context.model_config.shap_batch_size)
         except TypeError:
             shap_values = explainer([text])
         except Exception as exc:  # pragma: no cover
@@ -379,13 +363,14 @@ class DPMLMMechanism(DPMechanism):
     def __init__(
         self,
         config: DPMLMConfig,
-        settings: DPMLMRewriteSettings,
         selection_strategy: Optional[TokenSelectionStrategy] = None,
         scoring_strategy: Optional[ScoringStrategy] = None,
     ) -> None:
         self.config = config
-        self.settings = settings
-        self.core = DPMLMCore(config)
+        self.generic_cfg = config.generic
+        self.model_cfg = config.model
+        self.runtime_cfg = config.runtime
+        self.core = DPMLMCore(self.model_cfg, self.generic_cfg.device)
         self.device = self.core._get_device()
         logger.info("DPMLM privatizer initialized on device: %s", self.device)
 
@@ -406,8 +391,11 @@ class DPMLMMechanism(DPMechanism):
             text,
         )
         critical_spans = [span for span in spans if span.is_critical]
-        selected_ratio = len(critical_spans) / len(spans)
-        scaled_epsilon = epsilon * selected_ratio if self.settings.maintain_expected_noise else epsilon
+        selected_ratio = (len(critical_spans) / len(spans)) if spans else 0.0
+        if self.model_cfg.maintain_expected_noise and spans:
+            scaled_epsilon = epsilon * selected_ratio
+        else:
+            scaled_epsilon = epsilon
         logger.info("Identified %d critical spans out of %d total tokens.", len(critical_spans), len(spans))
         if len(critical_spans) == 0:
             logger.info("No critical spans identified; returning original text.")
@@ -420,10 +408,7 @@ class DPMLMMechanism(DPMechanism):
                 deleted_tokens=0
             )
 
-        context = ScoringContext(
-            risk_settings=self.settings,
-            mechanism=self,
-        )
+        context = ScoringContext(model_config=self.model_cfg, mechanism=self)
         scores = self.scoring_strategy.score(text, critical_spans, context)
         if scores.size != len(critical_spans):
             logger.debug("Scoring strategy returned invalid number of scores: %d out of %d.", scores.size, len(critical_spans))
@@ -450,18 +435,8 @@ class DPMLMMechanism(DPMechanism):
         if not self.validate_epsilon(epsilon):
             raise ValueError(f"Invalid epsilon: {epsilon}")
 
-        use_plus = kwargs.get('plus', False)
-        
-        if not use_plus:
-            kwargs.update({
-                'add_probability': 0.0, 
-                'delete_probability': 0.0,
-            })
-
-
-        # Get hyperparameters from kwargs with defaults
-        add_probability = kwargs.get('add_probability', kwargs.get('ADD_PROB', 0.15))
-        delete_probability = kwargs.get('delete_probability', kwargs.get('DEL_PROB', 0.05))
+        add_probability = self.model_cfg.add_probability
+        delete_probability = self.model_cfg.delete_probability
         
         perturbed = 0
         total = 0
@@ -470,7 +445,7 @@ class DPMLMMechanism(DPMechanism):
         result = text
         offset_adjust = 0
         
-        with DPMLMModelManager(self.config.model_config, str(self.device)) as (models, tokenizer):
+        with DPMLMModelManager(self.model_cfg.model, str(self.device)) as (models, tokenizer):
             lm_model, raw_model = models
             
             for i, span in enumerate(spans):
@@ -495,11 +470,11 @@ class DPMLMMechanism(DPMechanism):
                     delete_prob = 1.0  
                 else:
                     delete_prob = np.random.rand()
-                
+
                 if delete_prob >= delete_probability:
                     
                     private_token = self._privatize_single_token(
-                        text, span.text, local_epsilon, lm_model, raw_model, tokenizer, **kwargs
+                        text, span.text, local_epsilon, lm_model, raw_model, tokenizer
                     )
                     
                     
@@ -520,7 +495,7 @@ class DPMLMMechanism(DPMechanism):
                     add_prob = np.random.rand()
                     if add_prob <= add_probability:
                         add_word = self._generate_additional_token(
-                            text, local_epsilon, lm_model, raw_model, tokenizer, **kwargs
+                            text, local_epsilon, lm_model, raw_model, tokenizer
                         )
                         if add_word:
                             add_pos = adjusted_start + len(private_token)
@@ -551,18 +526,20 @@ class DPMLMMechanism(DPMechanism):
 
         return result
     
-    def _privatize_single_token(self, text: str, token: str, epsilon: float, 
-                               lm_model, raw_model, tokenizer, **kwargs) -> str:
+    def _privatize_single_token(
+        self,
+        text: str,
+        token: str,
+        epsilon: float,
+        lm_model,
+        raw_model,
+        tokenizer,
+    ) -> str:
         """Privatize a single token using the model."""
-        # Get hyperparameters from kwargs with defaults
-        use_temperature = kwargs.get('use_temperature', kwargs.get('TEMP', self.config.use_temperature))
-        k_candidates = kwargs.get('k_candidates', kwargs.get('K', self.config.k_candidates))
-        
-        
-        
-        
-        masked_text = text.replace(token, tokenizer.mask_token, 1)
+        use_temperature = self.model_cfg.use_temperature
+        k_candidates = self.model_cfg.k_candidates
 
+        masked_text = text.replace(token, tokenizer.mask_token, 1)
 
         input_ids = tokenizer.encode(masked_text, add_special_tokens=True)
 
@@ -571,7 +548,7 @@ class DPMLMMechanism(DPMechanism):
         except ValueError:
             return token
 
-        max_len = self.config.model_config.max_sequence_length
+        max_len = self.model_cfg.model.max_sequence_length
         aggregated_logits = None
         mask_count = 0
 
@@ -624,29 +601,31 @@ class DPMLMMechanism(DPMechanism):
             mask_logits = aggregated_logits / mask_count
 
         if use_temperature:
-            
             temperature = self.core._calculate_temperature(epsilon)
-            mask_logits = np.clip(mask_logits, self.config.clip_min, self.config.clip_max)
+            mask_logits = np.clip(mask_logits, self.model_cfg.clip_min, self.model_cfg.clip_max)
             mask_logits = mask_logits / temperature
-            
+
             scores = torch.softmax(torch.from_numpy(mask_logits), dim=0)
             scores = scores / scores.sum()
-            
-            
+
             chosen_idx = np.random.choice(len(mask_logits), p=scores.numpy())
             return tokenizer.decode(chosen_idx).strip()
-        else:
-            
-            top_tokens = torch.topk(torch.from_numpy(mask_logits), k=k_candidates, dim=0)[1]
-            return tokenizer.decode(top_tokens[0].item()).strip()
-    
-    def _generate_additional_token(self, text: str, epsilon: float, 
-                                  lm_model, raw_model, tokenizer, **kwargs) -> str:
+
+        top_tokens = torch.topk(torch.from_numpy(mask_logits), k=k_candidates, dim=0)[1]
+        return tokenizer.decode(top_tokens[0].item()).strip()
+
+    def _generate_additional_token(
+        self,
+        text: str,
+        epsilon: float,
+        lm_model,
+        raw_model,
+        tokenizer,
+    ) -> str:
         """Generate an additional token for insertion."""
-        # Get hyperparameters from kwargs with defaults
-        use_temperature = kwargs.get('use_temperature', kwargs.get('TEMP', self.config.use_temperature))
-        k_candidates = kwargs.get('k_candidates', kwargs.get('K', self.config.k_candidates))
-        
+        use_temperature = self.model_cfg.use_temperature
+        k_candidates = self.model_cfg.k_candidates
+
         masked_text = text + " " + tokenizer.mask_token
 
         input_ids = tokenizer.encode(masked_text, add_special_tokens=True)
@@ -656,7 +635,7 @@ class DPMLMMechanism(DPMechanism):
         except ValueError:
             return ""
 
-        max_len = self.config.model_config.max_sequence_length
+        max_len = self.model_cfg.model.max_sequence_length
         aggregated_logits = None
         mask_count = 0
 
@@ -710,28 +689,31 @@ class DPMLMMechanism(DPMechanism):
 
         if use_temperature:
             temperature = self.core._calculate_temperature(epsilon)
-            mask_logits = np.clip(mask_logits, self.config.clip_min, self.config.clip_max)
+            mask_logits = np.clip(mask_logits, self.model_cfg.clip_min, self.model_cfg.clip_max)
             mask_logits = mask_logits / temperature
-            
+
             scores = torch.softmax(torch.from_numpy(mask_logits), dim=0)
             scores = scores / scores.sum()
-            
+
             chosen_idx = np.random.choice(len(mask_logits), p=scores.numpy())
             return tokenizer.decode(chosen_idx).strip()
-        else:
-            top_tokens = torch.topk(torch.from_numpy(mask_logits), k=k_candidates, dim=0)[1]
-            return tokenizer.decode(top_tokens[0].item()).strip()
+
+        top_tokens = torch.topk(torch.from_numpy(mask_logits), k=k_candidates, dim=0)[1]
+        return tokenizer.decode(top_tokens[0].item()).strip()
 
     # ------------------------------------------------------------------
     # Strategy factory helpers
     # ------------------------------------------------------------------
     def _build_selection_strategy(self) -> TokenSelectionStrategy:
-        if self.config.process_pii_only:
-            return PIITokenSelection(annotator=self.settings.annotator, threshold=self.settings.pii_threshold)
+        if self.model_cfg.process_pii_only:
+            return PIITokenSelection(
+                annotator=self.model_cfg.annotator,
+                threshold=self.model_cfg.pii_threshold,
+            )
         return AllTokensSelection()
 
     def _build_scoring_strategy(self) -> ScoringStrategy:
-        mode = (self.settings.explainability_mode or "uniform").lower()
+        mode = (self.model_cfg.explainability_mode or "uniform").lower()
         if mode == "greedy":
             return GreedyScoring()
         if mode == "shap":
@@ -745,10 +727,10 @@ class DPMLMMechanism(DPMechanism):
         assert len(scores) > 0, "No scores provided for ranking weights."
 
         clipped = scores.astype(float)
-        if self.settings.clip_contribution is not None:
-            clipped = np.clip(clipped, 0.0, self.settings.clip_contribution)
+        if self.model_cfg.clip_contribution is not None:
+            clipped = np.clip(clipped, 0.0, self.model_cfg.clip_contribution)
 
-        positive = np.maximum(clipped, self.settings.min_weight)
+        positive = np.maximum(clipped, self.model_cfg.min_weight)
         total = float(positive.sum())
         if total <= 0.0:
             ranking = np.full_like(positive, 1.0 / positive.size)
@@ -758,18 +740,18 @@ class DPMLMMechanism(DPMechanism):
         return ranking
 
     def _compute_privacy_epsilons(self, ranking_weights: np.ndarray, epsilon: float) -> np.ndarray:
-        denom = np.maximum(ranking_weights, self.settings.min_weight)
+        denom = np.maximum(ranking_weights, self.model_cfg.min_weight)
         scale = denom * max(len(ranking_weights), 1)
         eps_values = epsilon / scale
         max_eps = epsilon * max(len(ranking_weights), 1)
-        eps_values = np.clip(eps_values, self.settings.min_weight, max_eps)
+        eps_values = np.clip(eps_values, self.model_cfg.min_weight, max_eps)
         return eps_values
 
     # ------------------------------------------------------------------
     # Helpers bridging to scoring strategies
     # ------------------------------------------------------------------
     def _resolve_label_index(self, pipeline: Any, text: str) -> int:
-        label_setting = self.settings.explainability_label
+        label_setting = self.model_cfg.explainability_label
         model = getattr(pipeline, "model", None)
         config = getattr(model, "config", None)
         label2id = getattr(config, "label2id", {}) if config else {}
@@ -885,7 +867,7 @@ class DPMLMMechanism(DPMechanism):
             return None
 
         try:
-            self._shap_explainer = shap.Explainer(pipeline, silent=self.settings.shap_silent)
+            self._shap_explainer = shap.Explainer(pipeline, silent=self.model_cfg.shap_silent)
         except Exception as exc:  # pragma: no cover
             logger.warning("Failed to initialise SHAP explainer: %s", exc)
             self._shap_explainer = None

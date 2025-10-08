@@ -17,15 +17,13 @@ from dpmlm.interfaces import (
 
 from dpmlm.config import (
     DPMLMConfig,
-    DPPromptConfig, 
+    DPMLMGenericConfig,
+    DPMLMModelConfig,
+    DPMLMRuntimeConfig,
+    DPPromptConfig,
     DPParaphraseConfig,
     DPBartConfig,
     AnnotatorConfig,
-    create_dpmlm_config,
-    create_dpprompt_config,
-    create_dpparaphrase_config,
-    create_dpbart_config,
-    create_annotator_config
 )
 
 from dpmlm.factory import (
@@ -40,7 +38,6 @@ from dpmlm.factory import (
 )
 
 from dpmlm.core import (
-    DPMLMRewriteSettings,
     DPMLMMechanism,
     TokenRiskAllocation,
     TokenSelectionStrategy,
@@ -64,16 +61,14 @@ __all__ = [
     
     # Configuration
     "DPMLMConfig",
+    "DPMLMGenericConfig",
+    "DPMLMModelConfig",
+    "DPMLMRuntimeConfig",
     "DPPromptConfig",
     "DPParaphraseConfig", 
     "DPBartConfig",
     "AnnotatorConfig",
-    "create_dpmlm_config",
-    "create_dpprompt_config",
-    "create_dpparaphrase_config",
-    "create_dpbart_config",
-    "create_annotator_config",
-    
+
     # Factory functions
     "create_mechanism",
     "create_from_preset", 
@@ -85,7 +80,6 @@ __all__ = [
     "build_dpbart_config",
     
     # Explainability-aware DP
-    "DPMLMRewriteSettings",
     "DPMLMMechanism",
     "TokenRiskAllocation",
     "TokenSelectionStrategy",

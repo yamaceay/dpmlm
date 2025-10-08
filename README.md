@@ -71,11 +71,16 @@ print("Available mechanisms:", dpmlm.list_mechanisms())
 print("Available presets:", dpmlm.list_presets())
 
 # Create a mechanism
-mechanism = dpmlm.create_mechanism("dpmlm", config={
-    "epsilon": 1.0,
-    "process_pii_only": True,
-    "model_name": "roberta-base"
-})
+mechanism = dpmlm.create_mechanism(
+    "dpmlm",
+    config={
+        "generic": {"device": "auto"},
+        "model": {
+            "process_pii_only": True,
+            "model": {"model_name": "roberta-base"},
+        },
+    },
+)
 
 # Apply privacy
 result = mechanism.privatize("Hello John Doe", epsilon=1.0)
@@ -93,7 +98,12 @@ Choose from pre-configured settings optimized for different privacy needs:
 mechanism = dpmlm.create_from_preset("dpmlm_high_privacy")
 
 # PII-focused processing
-mechanism = dpmlm.create_from_preset("dpmlm_pii_focused", annotator=pii_model)
+mechanism = dpmlm.create_from_preset(
+    "dpmlm_pii_focused",
+    override_config={
+        "model": {"annotator": pii_model},
+    },
+)
 
 # Basic configuration
 mechanism = dpmlm.create_from_preset("dpmlm_basic")
@@ -110,16 +120,16 @@ The package supports various differential privacy mechanisms:
 
 ```python
 # DP-MLM (masked language model approach)
-dpmlm_mechanism = dpmlm.create_mechanism("dpmlm", epsilon=1.0)
+dpmlm_mechanism = dpmlm.create_mechanism("dpmlm")
 
 # DP-Prompt (prompt-based paraphrasing)
-dpprompt_mechanism = dpmlm.create_mechanism("dpprompt", epsilon=1.0)
+dpprompt_mechanism = dpmlm.create_mechanism("dpprompt")
 
 # DP-Paraphrase (fine-tuned paraphrasing)
-dpparaphrase_mechanism = dpmlm.create_mechanism("dpparaphrase", epsilon=1.0)
+dpparaphrase_mechanism = dpmlm.create_mechanism("dpparaphrase")
 
 # DP-Bart (BART-based with noise injection)
-dpbart_mechanism = dpmlm.create_mechanism("dpbart", epsilon=1.0)
+dpbart_mechanism = dpmlm.create_mechanism("dpbart")
 ```
 
 ### 🛡️ **PII-Aware Processing**
@@ -135,10 +145,13 @@ with TorchTokenClassifier('path/to/pii/model', DataLabels(labels)) as (model, to
     annotator = PIIDeidentifier('outputs', model, tokenizer, DataLabels(labels))
 
 # Create DPMLM with PII awareness
-mechanism = dpmlm.create_mechanism("dpmlm", annotator=annotator, config={
-    "process_pii_only": True,  # Only privatize detected PII
-    "epsilon": 1.0
-})
+config = {
+    "model": {
+        "process_pii_only": True,  # Only privatize detected PII
+        "annotator": annotator,
+    }
+}
+mechanism = dpmlm.create_mechanism("dpmlm", config=config)
 
 result = mechanism.privatize("Mr. John Smith lives in New York", epsilon=1.0)
 # Only names and locations will be privatized
@@ -151,17 +164,19 @@ Fine-tune mechanisms with type-safe configuration:
 ```python
 # Build custom configuration
 config = dpmlm.build_dpmlm_config(
-    epsilon=1.0,
     alpha=0.003,
     process_pii_only=True,
     use_temperature=True,
-    model_name="roberta-base",
-    max_sequence_length=512,
+    model={
+        "model_name": "roberta-base",
+        "max_sequence_length": 512,
+    },
     add_probability=0.15,  # For "plus" method
     delete_probability=0.05
 )
 
 mechanism = dpmlm.create_mechanism("dpmlm", config=config)
+result = mechanism.privatize(sample_text, epsilon=1.0)
 ```
 
 ## Requirements & Downloads

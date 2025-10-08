@@ -50,64 +50,121 @@ class ModelConfig:
 
 
 @dataclass
-class DPMLMConfig(BaseConfig):
-    """Configuration for DPMLM mechanism."""
-    model_config: ModelConfig = field(default_factory=ModelConfig)
-    
-    
+class DPMLMGenericConfig:
+    """Top-level runtime knobs that apply across DPMLM sessions."""
+
+    device: str = "auto"
+    seed: Optional[int] = 42
+    verbose: bool = False
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if self.device not in ["auto", "cuda", "cpu", "mps"]:
+            raise ValueError(f"Invalid device: {self.device}")
+
+
+@dataclass
+class DPMLMRuntimeConfig:
+    """Runtime arguments that are provided per invocation."""
+
+    input_text: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if self.input_text is not None and not isinstance(self.input_text, str):
+            raise ValueError("input_text must be a string when provided")
+
+
+@dataclass
+class DPMLMModelConfig:
+    """Model-specific configuration defining the DPMLM behaviour."""
+
+    model: ModelConfig = field(default_factory=ModelConfig)
     alpha: float = 0.003
     clip_min: float = -3.2093127
     clip_max: float = 16.304797887802124
-    
-    
     use_treebank_tokenizer: bool = True
-    preserve_case: bool = True
-    
-    
     k_candidates: int = 5
-    filter_words: bool = True
-    use_pos_tags: bool = True
-    concat_sentences: bool = True
-    english_only: bool = True
     use_temperature: bool = True
-    
-    
     process_pii_only: bool = True
-    annotator_config: Optional[Dict[str, Any]] = None
-    
-    
     add_probability: float = 0.15
     delete_probability: float = 0.05
+    risk_pipeline: Optional[Any] = None
+    annotator: Optional[Any] = None
+    pii_threshold: float = 0.0
+    min_weight: float = 1e-6
+    maintain_expected_noise: bool = True
+    clip_contribution: Optional[float] = None
+    explainability_mode: str = "uniform"
+    explainability_label: Optional[Any] = None
+    mask_text: str = "[MASK]"
+    shap_silent: bool = True
+    shap_batch_size: int = 1
 
-    def __post_init__(self):
-        """Post-initialization processing."""
-        
-        if isinstance(self.model_config, dict):
-            self.model_config = ModelConfig(**self.model_config)
-        elif self.model_config is None:
-            self.model_config = ModelConfig()
-        super().__post_init__()
-    
+    def __post_init__(self) -> None:
+        if isinstance(self.model, dict):
+            self.model = ModelConfig(**self.model)
+        elif self.model is None:
+            self.model = ModelConfig()
+        self.validate()
+
     def validate(self) -> None:
-        """Validate DPMLM configuration."""
-        super().validate()
-        self.model_config.validate()
-        
+        self.model.validate()
         if self.alpha <= 0:
             raise ValueError(f"Alpha must be positive, got {self.alpha}")
         if self.clip_min >= self.clip_max:
-            raise ValueError(f"clip_min ({self.clip_min}) must be less than clip_max ({self.clip_max})")
+            raise ValueError(
+                f"clip_min ({self.clip_min}) must be less than clip_max ({self.clip_max})"
+            )
         if self.k_candidates <= 0:
             raise ValueError(f"k_candidates must be positive, got {self.k_candidates}")
         if not 0 <= self.add_probability <= 1:
             raise ValueError(f"add_probability must be in [0,1], got {self.add_probability}")
         if not 0 <= self.delete_probability <= 1:
-            raise ValueError(f"delete_probability must be in [0,1], got {self.delete_probability}")
+            raise ValueError(
+                f"delete_probability must be in [0,1], got {self.delete_probability}"
+            )
+        if self.explainability_mode.lower() not in {"uniform", "greedy", "shap"}:
+            raise ValueError(
+                "explainability_mode must be one of {'uniform', 'greedy', 'shap'}"
+            )
+        if self.min_weight <= 0:
+            raise ValueError(f"min_weight must be positive, got {self.min_weight}")
+        if self.shap_batch_size <= 0:
+            raise ValueError(
+                f"shap_batch_size must be positive, got {self.shap_batch_size}"
+            )
 
     @property
     def sensitivity(self) -> float:
-        """Calculate sensitivity from clip values."""
         return abs(self.clip_max - self.clip_min)
+
+
+@dataclass
+class DPMLMConfig:
+    """Composite DPMLM configuration with explicit parameter categories."""
+
+    generic: DPMLMGenericConfig = field(default_factory=DPMLMGenericConfig)
+    model: DPMLMModelConfig = field(default_factory=DPMLMModelConfig)
+    runtime: DPMLMRuntimeConfig = field(default_factory=DPMLMRuntimeConfig)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.generic, dict):
+            self.generic = DPMLMGenericConfig(**self.generic)
+        if isinstance(self.model, dict):
+            self.model = DPMLMModelConfig(**self.model)
+        if isinstance(self.runtime, dict):
+            self.runtime = DPMLMRuntimeConfig(**self.runtime)
+        self.validate()
+
+    def validate(self) -> None:
+        self.generic.validate()
+        self.model.validate()
+        self.runtime.validate()
 
 
 @dataclass  
@@ -286,25 +343,3 @@ class AnnotatorConfig:
             logger.warning("Model path does not exist: %s", self.model_path)
         if not self.unique_labels:
             raise ValueError("unique_labels cannot be empty")
-
-
-
-def create_dpmlm_config(**kwargs) -> DPMLMConfig:
-    """Create DPMLM configuration with custom parameters."""
-    return DPMLMConfig(**kwargs)
-
-def create_dpprompt_config(**kwargs) -> DPPromptConfig:
-    """Create DPPrompt configuration with custom parameters."""
-    return DPPromptConfig(**kwargs)
-
-def create_dpparaphrase_config(**kwargs) -> DPParaphraseConfig:
-    """Create DPParaphrase configuration with custom parameters."""
-    return DPParaphraseConfig(**kwargs)
-
-def create_dpbart_config(**kwargs) -> DPBartConfig:
-    """Create DPBart configuration with custom parameters."""
-    return DPBartConfig(**kwargs)
-
-def create_annotator_config(**kwargs) -> AnnotatorConfig:
-    """Create annotator configuration with custom parameters."""
-    return AnnotatorConfig(**kwargs)
