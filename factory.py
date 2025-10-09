@@ -56,6 +56,29 @@ class DPMechanismFactory:
         """List available mechanism types."""
         return list(self._creators.keys())
 
+    @staticmethod
+    def _normalize_llmdp_payload(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Flatten structured LLMDP configuration sections into a single mapping."""
+        config_dict = dict(config or {})
+        has_sections = any(
+            isinstance(config_dict.get(section), dict)
+            for section in ("generic", "model", "runtime")
+        )
+        if not has_sections:
+            return config_dict
+
+        flattened: Dict[str, Any] = {}
+        for section in ("generic", "model", "runtime"):
+            section_payload = config_dict.get(section)
+            if isinstance(section_payload, dict):
+                flattened.update(section_payload)
+
+        for key, value in config_dict.items():
+            if key not in {"generic", "model", "runtime"} and key not in flattened:
+                flattened[key] = value
+
+        return flattened
+
     def _create_dpmlm(self, config: Optional[Dict[str, Any]]) -> DPMechanism:
         """Create risk-aware DPMLM rewrite mechanism."""
 
@@ -101,12 +124,13 @@ class DPMechanismFactory:
         except ImportError as e:
             logger.error("Failed to import DPPromptPrivatizer: %s", e)
             raise ImportError("DPPrompt dependencies not available") from e
-        
+
         if isinstance(config, DPPromptConfig):
             dp_config = config
         else:
-            dp_config = DPPromptConfig(**(config or {}))
-        
+            payload = self._normalize_llmdp_payload(config)
+            dp_config = DPPromptConfig(**payload)
+
         return DPPromptPrivatizer(dp_config)
     
     def _create_dpparaphrase(self, config: Optional[Dict[str, Any]]) -> DPMechanism:  
@@ -120,7 +144,8 @@ class DPMechanismFactory:
         if isinstance(config, DPParaphraseConfig):
             dp_config = config
         else:
-            dp_config = DPParaphraseConfig(**(config or {}))
+            payload = self._normalize_llmdp_payload(config)
+            dp_config = DPParaphraseConfig(**payload)
         
         return DPParaphrasePrivatizer(dp_config)
     
@@ -135,7 +160,8 @@ class DPMechanismFactory:
         if isinstance(config, DPBartConfig):
             dp_config = config
         else:
-            dp_config = DPBartConfig(**(config or {}))
+            payload = self._normalize_llmdp_payload(config)
+            dp_config = DPBartConfig(**payload)
         
         return DPBartPrivatizer(dp_config)
 

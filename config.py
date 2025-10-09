@@ -42,6 +42,10 @@ class ModelConfig:
     truncation: bool = True
     padding: bool = True
     cache_dir: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.model_name = str(Path(self.model_name).expanduser())
+        self.validate()
     
     def validate(self) -> None:
         """Validate model configuration."""
@@ -222,7 +226,7 @@ class DPPromptConfig(BaseConfig):
 class DPParaphraseConfig(BaseConfig):
     """Configuration for DPParaphrase mechanism."""
     model_config: ModelConfig = field(default_factory=lambda: ModelConfig(
-        model_name="models/gpt2-paraphraser",
+        model_name=str(Path().home() / "models/gpt2-paraphraser"),
         max_sequence_length=512
     ))
     
@@ -244,7 +248,7 @@ class DPParaphraseConfig(BaseConfig):
             self.model_config = ModelConfig(**self.model_config)
         elif self.model_config is None:
             self.model_config = ModelConfig(
-                model_name="models/gpt2-paraphraser",
+                model_name=str(Path().home() / "models/gpt2-paraphraser"),
                 max_sequence_length=512
             )
         super().__post_init__()

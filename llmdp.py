@@ -70,7 +70,7 @@ class DPPromptPrivatizer(DPMechanism):
         temperature = self._calculate_temperature(epsilon)
         prompt = self._create_prompt(text)
         
-        with DPPromptModelManager(self.config.model_config) as (model, tokenizer):
+        with DPPromptModelManager(self.config.model_config, self.config.device) as (model, tokenizer):
             
             model_inputs = tokenizer(
                 prompt, 
@@ -163,14 +163,16 @@ class DPParaphrasePrivatizer(DPMechanism):
         temperature = self._calculate_temperature(epsilon)
         prompt = self._create_prompt(text)
         
-        with DPParaphraseModelManager(self.config.model_config) as (model, tokenizer):
+        with DPParaphraseModelManager(self.config.model_config, self.config.device) as (model, tokenizer):
             
+            pipeline_device = str(model.device) if hasattr(model, "device") else self.config.device
+
             pipe = pipeline(
                 task="text-generation",
                 model=model,
                 tokenizer=tokenizer,
                 logits_processor=self.logits_processor,
-                device=model.device,
+                device=pipeline_device,
                 pad_token_id=tokenizer.eos_token_id
             )
             
@@ -288,23 +290,24 @@ class DPBartPrivatizer(DPMechanism):
         sigma = alpha * sensitivity / mpmath.sqrt(2.0 * epsilon)
         return float(sigma)
     
-    def _add_noise(self, vector: torch.Tensor, epsilon: float) -> torch.Tensor:
+    def _add_noise(self, vector: torch.Tensor, epsilon: float, method: Optional[str] = None) -> torch.Tensor:
         """Add differential privacy noise to vector."""
         k = vector.shape[-1]
+        noise_method = method or self.config.noise_method
         
-        if self.config.noise_method == "laplace":
+        if noise_method == "laplace":
             sensitivity = 2 * self.config.sigma * self.config.num_sigmas * k
             noise = torch.from_numpy(np.random.laplace(0, sensitivity / epsilon, size=k))
-        elif self.config.noise_method == "gaussian":
+        elif noise_method == "gaussian":
             sensitivity = 2 * self.config.sigma * self.config.num_sigmas * np.sqrt(k)
             scale = np.sqrt((sensitivity**2 / epsilon**2) * 2 * np.log(1.25 / self.config.delta))
             noise = torch.from_numpy(np.random.normal(0, scale, size=k))
-        elif self.config.noise_method == "analytic_gaussian":
+        elif noise_method == "analytic_gaussian":
             sensitivity = 2 * self.config.sigma * self.config.num_sigmas * np.sqrt(k)
             analytic_scale = self._calibrate_analytic_gaussian(epsilon, self.config.delta, sensitivity)
             noise = torch.from_numpy(np.random.normal(0, analytic_scale, size=k))
         else:
-            raise ValueError(f"Unknown noise method: {self.config.noise_method}")
+            raise ValueError(f"Unknown noise method: {noise_method}")
         
         return vector + noise
     
@@ -315,7 +318,7 @@ class DPBartPrivatizer(DPMechanism):
         
         method = kwargs.get('noise_method', self.config.noise_method)
         
-        with DPBartModelManager(self.config.model_config) as (models, tokenizer):
+        with DPBartModelManager(self.config.model_config, self.config.device) as (models, tokenizer):
             encoder_model, decoder_model = models
             
             
@@ -333,7 +336,7 @@ class DPBartPrivatizer(DPMechanism):
             
             
             clipped_hidden = self._clip_vector(enc_output["last_hidden_state"].cpu())
-            noisy_hidden = self._add_noise(clipped_hidden, epsilon)
+            noisy_hidden = self._add_noise(clipped_hidden, epsilon, method)
             enc_output["last_hidden_state"] = noisy_hidden.float().to(encoder_model.device)
             
             
