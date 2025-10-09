@@ -125,13 +125,7 @@ class DPMechanismFactory:
             logger.error("Failed to import DPPromptPrivatizer: %s", e)
             raise ImportError("DPPrompt dependencies not available") from e
 
-        if isinstance(config, DPPromptConfig):
-            dp_config = config
-        else:
-            payload = self._normalize_llmdp_payload(config)
-            dp_config = DPPromptConfig(**payload)
-
-        return DPPromptPrivatizer(dp_config)
+        return DPPromptPrivatizer()
     
     def _create_dpparaphrase(self, config: Optional[Dict[str, Any]]) -> DPMechanism:  
         """Create DPParaphrase mechanism."""
@@ -141,13 +135,7 @@ class DPMechanismFactory:
             logger.error("Failed to import DPParaphrasePrivatizer: %s", e)
             raise ImportError("DPParaphrase dependencies not available") from e
         
-        if isinstance(config, DPParaphraseConfig):
-            dp_config = config
-        else:
-            payload = self._normalize_llmdp_payload(config)
-            dp_config = DPParaphraseConfig(**payload)
-        
-        return DPParaphrasePrivatizer(dp_config)
+        return DPParaphrasePrivatizer()
     
     def _create_dpbart(self, config: Optional[Dict[str, Any]]) -> DPMechanism:  
         """Create DPBart mechanism."""
@@ -157,13 +145,7 @@ class DPMechanismFactory:
             logger.error("Failed to import DPBartPrivatizer: %s", e)
             raise ImportError("DPBart dependencies not available") from e
         
-        if isinstance(config, DPBartConfig):
-            dp_config = config
-        else:
-            payload = self._normalize_llmdp_payload(config)
-            dp_config = DPBartConfig(**payload)
-        
-        return DPBartPrivatizer(dp_config)
+        return DPBartPrivatizer()
 
 
 class ConfigurableDPFactory:
@@ -171,63 +153,7 @@ class ConfigurableDPFactory:
     
     def __init__(self):
         self.base_factory = DPMechanismFactory()
-        self._presets = {
-            "dpmlm_basic": {
-                "type": "dpmlm",
-                "config": {
-                    "model": {
-                        "use_temperature": True,
-                        "process_pii_only": False,
-                    }
-                }
-            },
-            "dpmlm_pii_focused": {
-                "type": "dpmlm", 
-                "config": {
-                    "model": {
-                        "use_temperature": True,
-                        "process_pii_only": True,
-                    }
-                }
-            },
-            "dpmlm_high_privacy": {
-                "type": "dpmlm",
-                "config": {
-                    "model": {
-                        "use_temperature": True,
-                        "process_pii_only": True,
-                        "add_probability": 0.0,
-                        "delete_probability": 0.0,
-                    }
-                }
-            },
-            "dpprompt_default": {
-                "type": "dpprompt",
-                "config": {
-                    "epsilon": 1.0
-                }
-            },
-            "dpparaphrase_default": {
-                "type": "dpparaphrase", 
-                "config": {
-                    "epsilon": 1.0
-                }
-            },
-            "dpbart_gaussian": {
-                "type": "dpbart",
-                "config": {
-                    "epsilon": 1.0,
-                    "noise_method": "gaussian"
-                }
-            },
-            "dpbart_analytic": {
-                "type": "dpbart",
-                "config": {
-                    "epsilon": 1.0,
-                    "noise_method": "analytic_gaussian"
-                }
-            }
-        }
+        self._presets = {}
     
     def create_from_preset(self, preset_name: str,
                           override_config: Optional[Dict[str, Any]] = None) -> DPMechanism:
