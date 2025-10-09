@@ -9,6 +9,8 @@ from pathlib import Path
 import mpmath
 from mpmath import mp
 
+from dataclasses import dataclass
+
 import nltk
 nltk.download('punkt_tab', quiet=True)
 
@@ -23,27 +25,18 @@ class ClipLogitsProcessor(LogitsProcessor):
     scores = torch.clamp(scores, min=self.min, max=self.max)
     return scores
   
-class DPPromptPrivatizer():
-    model_checkpoint = None
-    min_logit = None
-    max_logit = None
-    sensitivity = None
-    logits_processor = None
+@dataclass
+class DPPromptPrivatizer:
+    model_checkpoint="google/flan-t5-base"
+    min_logit=-19.22705113016047
+    max_logit=7.48324937989716
+    max_length=512
+    device=None
 
-    tokenizer = None
-    model = None
-    device = None
-
-    def __init__(self, model_checkpoint="google/flan-t5-base", min_logit=-19.22705113016047, max_logit=7.48324937989716):
-        self.model_checkpoint = model_checkpoint
-
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    def __post_init__(self):
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_checkpoint)
         self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_checkpoint).to(self.device)
 
-        self.min_logit = min_logit
-        self.max_logit = max_logit
         self.sensitivity = abs(self.max_logit - self.min_logit)
         self.logits_processor = LogitsProcessorList([ClipLogitsProcessor(self.min_logit, self.max_logit)])
 
@@ -57,7 +50,7 @@ class DPPromptPrivatizer():
 
         prompt = self.prompt_template_fn(text)
 
-        model_inputs = self.tokenizer(prompt, max_length=512, truncation=True, return_tensors="pt").to(self.device)
+        model_inputs = self.tokenizer(prompt, max_length=self.max_length, truncation=True, return_tensors="pt").to(self.device)
         output = self.model.generate(
             **model_inputs,
             do_sample = True,
@@ -78,27 +71,17 @@ class DPPromptPrivatizer():
             metadata={"epsilon": epsilon}
         )
 
+@dataclass
 class DPParaphrasePrivatizer():
-    model_checkpoint = None
-    min_logit = None
-    max_logit = None
-    sensitivity = None
-    logits_processor = None
+    model_checkpoint = "./models/gpt2-paraphraser"
+    min_logit=-96.85249956065758
+    max_logit=-8.747697966442914
+    device=None
 
-    tokenizer = None
-    model = None
-    device = None
-
-    def __init__(self, model_checkpoint="./models/gpt2-paraphraser", min_logit=-96.85249956065758, max_logit=-8.747697966442914):
-        self.model_checkpoint = model_checkpoint
-
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    def __post_init__(self):
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_checkpoint)
         self.model = AutoModelForCausalLM.from_pretrained(self.model_checkpoint, pad_token_id=self.tokenizer.eos_token_id).to(self.device)
 
-        self.min_logit = min_logit
-        self.max_logit = max_logit
         self.sensitivity = abs(self.max_logit - self.min_logit)
         self.logits_processor = LogitsProcessorList([ClipLogitsProcessor(self.min_logit, self.max_logit)])
 
@@ -127,27 +110,19 @@ class DPParaphrasePrivatizer():
             metadata={"epsilon": epsilon}
         )
 
+@dataclass
 class DPBartPrivatizer():
-    model = None
-    decoder = None
-    tokenizer = None
+    sigma = 0.2
+    num_sigmas=1/2
+    delta = 1e-5
+    max_length=512
+    device=None
 
-    sigma = None
-    num_sigmas = None
-    c_min = None
-    c_max = None
-    delta = None
-
-    def __init__(self, model='facebook/bart-base', num_sigmas=1/2):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    def __post_init__(self, model='facebook/bart-base', ):
         self.tokenizer = BartTokenizer.from_pretrained(model)
         self.model = BartModel.from_pretrained(model).to(self.device)
         self.decoder = BartForConditionalGeneration.from_pretrained(model).to(self.device)
 
-        self.delta = 1e-5
-        self.sigma = 0.2
-        self.num_sigmas = num_sigmas
         self.c_min = -self.sigma
         self.c_max = self.num_sigmas * self.sigma
 
@@ -237,7 +212,7 @@ class DPBartPrivatizer():
         return vector + Z
 
     def privatize(self, text, epsilon=100, method="gaussian"):
-        inputs = self.tokenizer(text, max_length=512, truncation=True, return_tensors="pt").to(self.device)
+        inputs = self.tokenizer(text, max_length=self.max_length, truncation=True, return_tensors="pt").to(self.device)
         num_tokens = len(inputs["input_ids"][0])
 
         enc_output = self.model.encoder(**inputs)
