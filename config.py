@@ -94,7 +94,6 @@ class DPMLMModelConfig:
     use_treebank_tokenizer: bool = True
     k_candidates: int = 5
     use_temperature: bool = True
-    process_pii_only: bool = False
     add_probability: float = 0.15
     delete_probability: float = 0.05
     risk_pipeline: Optional[Any] = None

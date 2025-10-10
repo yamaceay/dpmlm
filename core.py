@@ -705,7 +705,7 @@ class DPMLMMechanism(DPMechanism):
     # Strategy factory helpers
     # ------------------------------------------------------------------
     def _build_selection_strategy(self) -> TokenSelectionStrategy:
-        if self.model_cfg.process_pii_only:
+        if self.model_cfg.annotator is not None:
             return PIITokenSelection(
                 annotator=self.model_cfg.annotator,
                 threshold=self.model_cfg.pii_threshold,

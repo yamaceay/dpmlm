@@ -19,7 +19,6 @@ DPMLM_MODEL_KEYS = {
     "use_treebank_tokenizer",
     "k_candidates",
     "use_temperature",
-    "process_pii_only",
     "add_probability",
     "delete_probability",
     "risk_pipeline",
@@ -163,10 +162,6 @@ def prepare_dpmlm_model_config(
         annotator = annotator_loader(annotator_path)
         if annotator is not None:
             payload["annotator"] = annotator
-            payload.setdefault("process_pii_only", True)
-        else:
-            logger.warning("Disabling process_pii_only because annotator load failed.")
-            payload["process_pii_only"] = False
 
     risk_model = payload.pop("risk_model", None)
     risk_task = payload.pop("risk_task", "text-classification")
@@ -189,10 +184,6 @@ def prepare_dpmlm_model_config(
         mask_token = getattr(tokenizer, "mask_token", None)
         if mask_token and "mask_text" not in payload:
             payload["mask_text"] = mask_token
-
-    if payload.get("process_pii_only") and payload.get("annotator") is None:
-        logger.warning("process_pii_only requested but no annotator configured; disabling it.")
-        payload["process_pii_only"] = False
 
     mode = (payload.get("explainability_mode") or "uniform").lower()
     if mode in {"greedy", "shap"} and payload.get("risk_pipeline") is None:

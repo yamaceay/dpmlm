@@ -76,7 +76,6 @@ mechanism = dpmlm.create_mechanism(
     config={
         "generic": {"device": "auto"},
         "model": {
-            "process_pii_only": True,
             "model": {"model_name": "roberta-base"},
         },
     },
@@ -147,7 +146,6 @@ with TorchTokenClassifier('path/to/pii/model', DataLabels(labels)) as (model, to
 # Create DPMLM with PII awareness
 config = {
     "model": {
-        "process_pii_only": True,  # Only privatize detected PII
         "annotator": annotator,
     }
 }
@@ -165,7 +163,6 @@ Fine-tune mechanisms with type-safe configuration:
 # Build custom configuration
 config = dpmlm.build_dpmlm_config(
     alpha=0.003,
-    process_pii_only=True,
     use_temperature=True,
     model={
         "model_name": "roberta-base",

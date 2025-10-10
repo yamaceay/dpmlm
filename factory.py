@@ -241,14 +241,12 @@ def list_presets() -> List[str]:
 
 
 def build_dpmlm_config(
-    process_pii_only: bool = True,
     model_name: str = "roberta-base",
     **model_overrides: Any,
 ) -> Dict[str, Any]:
     """Build a DPMLM configuration payload using the new categorical layout."""
 
     model_section: Dict[str, Any] = {
-        "process_pii_only": process_pii_only,
         "model": {
             "model_name": model_name,
         },
