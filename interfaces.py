@@ -7,12 +7,9 @@ differential privacy text processing pipeline.
 """
 
 from abc import ABC, abstractmethod
-from typing import Protocol, Dict, List, Tuple, Any, Optional, Union, TYPE_CHECKING
+from typing import Protocol, Dict, List, Tuple, Any, Optional, Union
 from dataclasses import dataclass
-
-if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizer, PreTrainedModel
-
+from transformers import PreTrainedTokenizer, PreTrainedModel
 
 @dataclass
 class PrivacyResult:
